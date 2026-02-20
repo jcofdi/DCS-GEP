@@ -412,7 +412,7 @@ float4 PS_BLUR(const VS_OUTPUT i, uniform int GAUSS_KERNEL): SV_TARGET0 {
 	//
 	// Compare to V1's pow(2.5) applied before blur:
 	//   0.3 raw → pow(0.3, 2.5) = 0.05 → blur can't recover → near-black
-	return float4(pow(ao, 1.5), 0, 0, 1);
+	return float4(pow(ao, 1.0), 0, 0, 1);
 }
 
 //=============================================================================
