@@ -8,7 +8,7 @@ float4 effectParams;//emitter time, phase, wind.xy
 float3 effectParams2;//translusency
 float3 smokeColor;
 
-#define ANIMATION_SPEED			25
+#define ANIMATION_SPEED			35
 #define CLUSTER_COLOR			smokeColor.xyz
 #define CLUSTER_TRANSLUCENCY 	effectParams2.x
 #define CLUSTER_DETAIL_TILE		effectParams2.y

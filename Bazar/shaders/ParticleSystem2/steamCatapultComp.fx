@@ -94,6 +94,15 @@ PuffCluster initParticle(PuffCluster p, float3 from, float3 to, uint id)
 	p.reserved.y = particlePower;
 	p.reserved.w = gModelTime;//birth time
 
+	// V38: per-particle brightness jitter stored in .z of reserved
+	// Range: 0.7 to 1.0 — some puffs are dimmer, simulating internal
+	// density variation within the steam cloud. rnd.z is already available
+	// and uncorrelated with position (rnd.x) and turbulence offset (rnd.y).
+	// Combined with the linear lighting opacity fix in GetClusterInfo,
+	// this breaks up the flat uniform blob — jitter provides density
+	// variation while the lighting system handles directional contrast.
+	p.reserved.z = 0.7 + 0.3 * abs(rnd.z);
+
 	// V37: multiplier reduced from 5 to 2, giving ~1-3s lifetime
 	// Original gave ~2.5-7.5s which was too long for 30kt wind environment
 	p.sizeLifeOpacityRnd.y = 2*(0.5+0.5*t.w) * (1 + 0.5 * particlePower);
@@ -156,8 +165,9 @@ PuffCluster updateParticle(PuffCluster p, uint id, float distFromLineSq)
 	// Steam stays opaque until it hits ambient temp then cuts off quickly
 	// Note: /sizeFactor naturally brightens slightly during shrink phase
 	// as denominator decreases - wisp appears to intensify before vanishing
+	// V38: multiply by per-particle brightness jitter (reserved.z)
 	p.sizeLifeOpacityRnd.z  = saturate(age*4) * saturate((1-nAge)/0.15);
-	p.sizeLifeOpacityRnd.z *= saturate(1 - (distFromLine - distMax*0.7) / (distMax - distMax*0.7)) / sizeFactor * p.reserved.x;
+	p.sizeLifeOpacityRnd.z *= saturate(1 - (distFromLine - distMax*0.7) / (distMax - distMax*0.7)) / sizeFactor * p.reserved.x * p.reserved.z;
 
 	return p;
 }
@@ -211,7 +221,13 @@ void GetClusterInfo(uint id, out float3 pos, out float radius, out float opacity
 
 	pos     = posRadius.xyz;
 	radius  = sizeLifeOpacityRnd.x;// + posRadius.w;
-	opacity = sizeLifeOpacityRnd.z * sbParticles[id].sizeLifeOpacityRnd.z * 0.4;
+	// V38: linear opacity for lighting instead of squared (was z * z * 0.4)
+	// Squared opacity compressed the range too much, making the lighting
+	// system see all mid-opacity particles as nearly transparent. This
+	// reduced light/shadow contrast across the cloud, contributing to the
+	// flat uniform blob appearance. Linear response lets the cluster lighting
+	// system properly differentiate sun-facing vs shadow-facing particles.
+	opacity = sizeLifeOpacityRnd.z * 0.6;
 }
 
 #define LIGHTING_OUTPUT(id)				sbParticles[id].clusterLightAge.x
