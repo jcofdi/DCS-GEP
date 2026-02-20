@@ -44,6 +44,12 @@ float4x4 World;
 static const float turbulencePower = 10;
 static const float distMax = 1.5 * 1.5;//макс расстояние от линии
 
+// V38: anisotropic turbulence ratio — lateral spread is this fraction
+// of along-track turbulence. Based on reference footage showing tight
+// lateral confinement with strong along-track shearing.
+// 0.4 = lateral turbulence at 40% of along-track strength.
+static const float lateralTurbulenceRatio = 0.4;
+
 float DistToLine(float2 pt1, float2 pt2, float2 testPt)
 {
 	float2 lineDir = pt2 - pt1;
@@ -103,9 +109,24 @@ PuffCluster initParticle(PuffCluster p, float3 from, float3 to, uint id)
 	// variation while the lighting system handles directional contrast.
 	p.reserved.z = 0.7 + 0.3 * abs(rnd.z);
 
-	// V37: multiplier reduced from 5 to 2, giving ~1-3s lifetime
-	// Original gave ~2.5-7.5s which was too long for 30kt wind environment
-	p.sizeLifeOpacityRnd.y = 2*(0.5+0.5*t.w) * (1 + 0.5 * particlePower);
+	// =============================================
+	// V38: lifetime — tight range with rare lingerers
+	// =============================================
+	// Base range: ~0.5-1.9s active, ~0.45-1.5s idle
+	// Covers 95% of particles. Real catapult steam dissipates quickly
+	// in headwind — most wisps gone within 1-2s. Active launch boost
+	// is only 1.25x because launch steam is hotter and under more
+	// pressure differential, dispersing faster than idle residual.
+	//
+	// ~5% of particles get 2x life (lingerers) — dense steam pockets
+	// in humid/calm micro-conditions that persist up to ~3.5s.
+	// These use rnd.z near extremes (abs > 0.95), which also correlates
+	// with high brightness jitter (~0.985) — physically consistent
+	// since dense steam lasts longer due to higher thermal mass.
+	float baseLife = 1.5 * (0.3 + 0.7*t.w) * (1 + 0.25 * particlePower);
+	float lingerChance = step(0.95, abs(rnd.z)); // ~5% of particles
+	float lingerBoost = 1.0 + lingerChance * 1.0; // 2x life for lingerers
+	p.sizeLifeOpacityRnd.y = baseLife * lingerBoost;
 
 	return p;
 }
@@ -122,9 +143,43 @@ PuffCluster updateParticle(PuffCluster p, uint id, float distFromLineSq)
 
 	float windPower = length(windVel);
 
-	// V36+: stronger turbulence throw with variable magnitude noise
-	// Original normalize() constrained push to constant magnitude
+	// =============================================
+	// V38: anisotropic turbulence
+	// =============================================
+	// Headwind creates turbulent eddies primarily in the along-track
+	// direction. Lateral spread is driven by secondary vortices and is
+	// significantly weaker. Decompose noise into track-aligned and
+	// perpendicular components, scaling lateral by lateralTurbulenceRatio.
+	// This keeps the violent along-track shearing while producing the
+	// tight lateral confinement seen in carrier deck reference footage.
+	//
+	// Safety check: if startPos and endPos are too close (degenerate track),
+	// fall back to dampened isotropic turbulence to avoid NaN from normalize.
+	// NaN wouldn't crash the GPU but would cause particles to vanish and
+	// z-sort anomalies from undefined radix sort keys.
 	float2 noiseDir = (t.xy * 2 - 1) * (t.z * 2 - 1);
+
+	float2 trackVec = endPos.xz - startPos.xz;
+	float trackLen = length(trackVec);
+
+	if (trackLen > 0.1)
+	{
+		float2 trackDir = trackVec / trackLen;
+		float2 lateralDir = float2(-trackDir.y, trackDir.x);
+
+		float alongComponent = dot(noiseDir, trackDir);
+		float lateralComponent = dot(noiseDir, lateralDir);
+
+		noiseDir = trackDir * alongComponent
+		         + lateralDir * lateralComponent * lateralTurbulenceRatio;
+	}
+	else
+	{
+		// Fallback: isotropic but at reduced power (~60% of full)
+		// to approximate the average of anisotropic behavior
+		noiseDir *= 0.6;
+	}
+
 	p.posRadius.xz += noiseDir * dT * turbulencePower * (0.5 + 0.5 * saturate(windPower));
 	p.posRadius.xz += windVel * dT * (0.2 + 0.8 * saturate(p.posRadius.y*0.5));
 
@@ -244,7 +299,7 @@ void csSortAndLight(uint GI: SV_GroupIndex)
 {
 	ParticleLightInfo p = GetParticleLightInfo(techLighting)(GI);
 
-	//шейдер выполняется чутка быстрее если сначала идет освещенка и потом сортировка
+	//шейдер выполняется чутка быстрее если сначала идет освещенк�� и потом сортировка
 	LIGHTING_OUTPUT(GI) = ComputeLightingInternal(techLighting)(GI, p, 0.9, 0, 0, LIGHTING_FLAGS);
 
 	float3 s = p.pos.xyz + worldOffset.xyz - gCameraPos.xyz;
