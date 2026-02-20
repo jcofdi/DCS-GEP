@@ -4,6 +4,7 @@
 #include "common/ambientCube.hlsl"
 #include "common/softParticles.hlsl"
 #include "common/random.hlsl"
+#include "common/dithering.hlsl"
 
 #define ATMOSPHERE_COLOR
 #include "ParticleSystem2/common/psCommon.hlsl"
@@ -127,40 +128,40 @@ float getAtmosphericDensityFactor()
 	return saturate(exp(-getAircraftAltitude() / 8500.0));
 }
 
-// Day/night attenuation for the emissive plume (modded: replaces the stub).
+// V2: GetAfterburnerAttenuation — reverted to stock behavior (return 1.0).
 //
-// Physical rationale:
-//   - At night the dark sky means even a dim emissive plume stands out sharply.
-//   - At noon, ambient scatter and sky luminance wash out the visible
-//     contribution of the flame compared to the background.
-//   - Twilight (~y=0) is the crossover; the plume is at natural intensity.
+// The previous version applied day/night modulation here, but this is
+// already handled by the rendering pipeline: additive blending naturally
+// makes the flame more visible against a dark sky and less visible against
+// a bright sky. The previous implementation was double-applying the
+// perceptual adjustment, causing a ~17.5% daytime dimming that compounded
+// with other opacity reductions.
 //
-// With attPower=0.5 (typical caller value):
-//   Noon  (y= 1.0): factor ~= 0.825  (subtle day reduction)
-//   Twilight(y= 0.0): factor ~= 1.0   (baseline)
-//   Night (y=-1.0): factor ~= 1.15  (night boost)
+// The function signature is preserved because it's called from multiple
+// places (psAfterburner, gsCircle, psFLIR) and could be re-enabled later
+// with corrected values if needed.
 float GetAfterburnerAttenuation(float attPower = 1.0)
 {
-	float sunElev     = gSunDir.y;
-	float dayWashout  = attPower * 0.35 * saturate(sunElev);   // up to -35% at noon
-	float nightBoost  = attPower * 0.30 * saturate(-sunElev);  // up to +30% at midnight
-	return 1.0 - dayWashout + nightBoost;
+	return 1;
 }
 
 // Dynamic heat shimmer power (modded: replaces static hotAirPower in hot-air paths).
 //
-// Two competing factors:
-//   1. Atmospheric density: thin air at altitude = less medium to refract through
-//   2. Thermal gradient: cold night air = steeper gradient around hot exhaust
+// V2: base multiplier increased from 0.1 to 0.7.
+// The previous 0.1 reduced shimmer to 10% of stock at sea level, making it
+// effectively invisible. 0.7 preserves the density/night scaling concept
+// while keeping the base case at sea level close to stock (0.5 * 0.7 = 0.35
+// at noon, vs stock 0.5). Night thermal boost and altitude thinning still
+// apply for physical accuracy.
 //
 // Net effect:
-//   Sea level noon  : ~0.05    Sea level night : ~0.09
-//   10 km noon      : ~0.016   10 km night     : ~0.028
+//   Sea level noon  : ~0.35    Sea level night : ~0.63
+//   10 km noon      : ~0.11   10 km night     : ~0.20
 float getDynamicHotAirPower()
 {
 	float density      = getAtmosphericDensityFactor();
 	float nightThermal = 1.0 + 0.8 * saturate(-gSunDir.y);
-	return hotAirPower * 0.1 * density * nightThermal;
+	return hotAirPower * 0.7 * density * nightThermal;
 }
 
 // Glow halo modulator (modded).
@@ -241,7 +242,6 @@ void gsAfterburner(point DS_OUTPUT input[1], inout TriangleStream<GS_OUTPUT> out
 	float3 normal = cross(normalize(pos), float3(1,0,0));
 	normal = mul(float4(normal,0), World).xyz;
 	
-	// o.UV.z = gsOpacity * pow(abs(dot(normal, gView._13_23_33)), 1);
 	o.UV.z = pow(abs(dot(normal, gView._13_23_33)), 0.3);
 	o.UV.z *= 0.4 +0.6*gsOpacity;
 	o.UV.z *= opacityMax;
@@ -392,14 +392,13 @@ float4 psAfterburner(in GS_OUTPUT i, uniform bool bHotAir): SV_TARGET0
 
 	baseColor.a *= alphaOpacity;
 	
-	float3 emissive = baseColor.rgb*baseColor.rgb * (baseColor.a*baseColor.a);
-	
 	if(bHotAir)
 	{
 		float depth = depthTest(i.projPos.xy/i.projPos.w, i.projPos.z/i.projPos.w);
 		float4 p = mul(float4(0, 0, depth, 1), gProjInv);
 		float dist = min(1, p.z/(p.w*hotAirDistMax));
 		// modded: use getDynamicHotAirPower() so shimmer scales with altitude and time-of-day
+		// V2: base multiplier corrected from 0.1 to 0.7 so sea-level shimmer is visible
 		return float4(1, dist, 1, min(1, baseColor.a * baseColor.a * i.cldAlpha * getDynamicHotAirPower() * psOpacity * 2.5 * saturate(1 - (i.dist-hotAirDistOffset) * hotAirDistMaxInv)));
 	}
 	else
@@ -424,26 +423,57 @@ float4 psAfterburner(in GS_OUTPUT i, uniform bool bHotAir): SV_TARGET0
 
 		noise = lerp(noise, 0.00, saturate( (1-i.UV.x) + pow(sin(i.UV.y*PI), 5) ) );
 
-		// modded: multiplicative noise blending for tighter flame structure
-		baseColor.a *= (noiseMask + noise * pow(noiseMask,2));
+		// V2: restored stock additive noise blending.
+		// The previous multiplicative blend (baseColor.a *= noiseMask + noise * pow(noiseMask,2))
+		// reduced total opacity by 40-70% across all conditions because the multiplicative
+		// factor (noiseMask ≈ 0.0-0.4) was always < 1. Additive blending adds flame density
+		// in noisy regions, which is the correct behavior — turbulent combustion creates
+		// brighter pockets, not dimmer ones.
+		baseColor.a += noise*0.5 * pow(noiseMask,1.5);
 
-		// modded: reduce plume opacity in bright daylight (gSunAttenuation ~1 at noon, ~0 at night)
-		// This prevents the emissive plume from looking unnaturally dense in full ambient light.
-		baseColor.a *= 1.0 - 0.4 * pow(gSunAttenuation, 6);
+		// V2: removed the redundant daylight opacity reduction.
+		// The previous line: baseColor.a *= 1.0 - 0.4 * pow(gSunAttenuation, 6)
+		// applied a SECOND daytime dimming on top of GetAfterburnerAttenuation,
+		// compounding to ~50% total brightness at noon vs stock. Additive blending
+		// already handles the perceptual day/night contrast difference — the same
+		// emissive value naturally pops less against a bright sky.
+		// (line removed)
 
-		// modded: altitude-dependent Mach diamond / shock color shift
-		// Lower air pressure at altitude makes shock diamonds more prominent and
-		// shifts their plasma color further into violet/blue.
-		float altColorBoost  = saturate(getAircraftAltitude() / 9000.0);
-		float3 shockTint     = lerp(float3(0.32, 0.25, 0.91), float3(0.18, 0.14, 1.05), altColorBoost);
-		float3 expansionTint = lerp(float3(0.8, 0.82, 1.39), float3(0.55, 0.60, 1.55), altColorBoost);
-		baseColor.rgb *= lerp(
-			float3(1,1,1),
-			lerp(shockTint, expansionTint, 0.25*sin(1.57*i.UV.x) + 0.75*(0.9-abs(1.8*i.UV.y-0.9))),
-			1-cos(gSunAttenuation * gSunAttenuation * gSunAttenuation * gSunAttenuation * 1.57)
-		);
+		// V2: removed the altitude-dependent shock color shift.
+		// The previous implementation applied a blue/violet tint driven by
+		// gSunAttenuation, but the lerp weight was backwards (strongest at noon,
+		// absent at night) and the tint vectors had components > 1.0 which
+		// darkened the R/G channels. Shock diamond color is better handled by
+		// the circle texture itself and the circle pass (psCircle), not by
+		// tinting the entire volume plume.
+		// (block removed)
 
-		return baseColor * baseColor * i.cldAlpha*volumeBrightness;
+		// V2: linearized output — split sRGB→linear conversion from alpha.
+		//
+		// Stock: return baseColor * baseColor * cldAlpha * volumeBrightness
+		// The squaring served double duty: sRGB→linear on .rgb AND squaring .a.
+		// But for an additively-blended emissive effect, squaring alpha is wrong:
+		//   - Mid-range alpha (0.3) becomes 0.09 → outer flame disappears
+		//   - Only peak values survive → hard-edged plume with no falloff
+		//   - The soft luminous sheath visible in reference footage is lost
+		//
+		// Fix: square .rgb only (genuine sRGB→linear for the texture color).
+		// Keep .a linear so the full dynamic range of the flame's opacity
+		// gradient is preserved — bright core through soft outer glow.
+		float3 linearColor = baseColor.rgb * baseColor.rgb; // sRGB→linear
+		float  linearAlpha = baseColor.a;                    // keep linear
+
+		// V2: IGN dither on alpha to break framebuffer quantization banding
+		// at the plume edge. The 1/128 amplitude is slightly above a single
+		// 8-bit step (1/255) to ensure the dither spans at least one code
+		// value even after the additive accumulation of multiple segments.
+		// This smooths the hard visible contour where the plume fades into
+		// the background, replacing the abrupt ring with noise-scattered
+		// single-bit variations that are imperceptible in motion.
+		float ign = interleavedGradientNoise(i.pos.xy);
+		linearAlpha += (ign - 0.5) * (1.0 / 128.0);
+
+		return float4(linearColor * linearAlpha, linearAlpha) * i.cldAlpha * volumeBrightness;
 	}
 #endif
 }
@@ -482,9 +512,15 @@ float4 psCircle(in GS_OUTPUT i, uniform bool bHotAir): SV_TARGET0
 	else
 	{
 		float4 clr = afterburnerTex.Sample(ClampLinearSampler, i.UV.xy);
-		// modded: night-shifted blue/violet tint on circles driven by gSunAttenuation
-		clr.rgb *= lerp(float3(1,1,1), float3(0.8, 0.82, 1.39), 1-cos(gSunAttenuation * gSunAttenuation * gSunAttenuation * gSunAttenuation * 1.57));
 		clr.a *= alphaOpacity;
+
+		// V2: IGN dither at circle edge to soften the quad boundary.
+		// The BlackBorderLinearSampler produces a hard 0→texture transition
+		// at the circle quad edges. Dithering the alpha at that boundary
+		// breaks up the visible rectangular clip of each shock diamond.
+		float ign = interleavedGradientNoise(i.pos.xy);
+		clr.a += (ign - 0.5) * (2.0 / 255.0);
+
 		return clr * i.UV.z * 0.72*circleBrightness;
 	}
 }
