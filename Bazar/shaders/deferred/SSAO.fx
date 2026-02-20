@@ -18,6 +18,12 @@
 //   - Interleaved gradient noise for per-pixel jitter (uses common/dithering.hlsl)
 //   - Physically-based cosine-weighted visibility instead of heuristic accumulation
 //   - Tunable cockpit vs external AO radius
+//
+// V2 changes:
+//   - FinalValuePower moved from GTAO_Value to PS_BLUR (blur-then-contrast ordering)
+//   - Power reduced from 2.5 to 1.5 (XeGTAO reference default for outdoor/mixed scenes)
+//   - DIST_FACTOR reduced from 4.0 to 3.0 (matches stock radius, tighter shadow spread)
+//   - Minimum visibility raised from 0.03 to 0.08 (prevents near-black AO patches)
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "common/samplers11.hlsl"
@@ -291,14 +297,30 @@ float2 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SL
 	// Average over all slices
 	visibility /= float(SLICES);
 
-	// Apply power curve for contrast control
-	// XeGTAO default is 2.2; we use 2.5 for slightly stronger cockpit/crevice darkening
-	// that suits the DCS aesthetic (military hardware with deep panel lines and intakes)
-	visibility = pow(visibility, 2.5);
+	// V2: Power curve REMOVED from here — moved to PS_BLUR.
+	//
+	// Previously: visibility = pow(visibility, 2.5);
+	//
+	// Applying the contrast curve before the blur meant the bilateral blur
+	// operated on already-crushed values. Dark AO patches (0.05-0.10 after
+	// pow 2.5) couldn't be softened effectively by averaging with neighbors
+	// that were equally dark. This caused hard-edged, unnaturally black
+	// shadows around thin features like weapon pylons and propeller blades.
+	//
+	// By outputting the raw visibility here and applying the power curve
+	// AFTER the blur in PS_BLUR, the blur operates on gentler values
+	// (0.3-0.5 range) where averaging is effective. The blur softens the
+	// raw occlusion, then the power curve adds contrast to the softened
+	// result. This matches the stock pipeline's ordering (raw AO → blur →
+	// pow(ao, 3)) and produces shadows that are visible but not black.
 
-	// Disallow total blackness — a fully visible pixel shouldn't go to zero
-	// (also helps numerical stability in the blur pass)
-	visibility = max(0.03, visibility);
+	// V2: Raised minimum from 0.03 to 0.08.
+	// Prevents absolute black AO even in worst-case geometry (deep crevices,
+	// overlapping surfaces). At 0.03, compose.hlsl would multiply the scene
+	// color by 0.03 = nearly invisible. At 0.08, the darkest possible AO
+	// still lets ~8% of the lit surface color through, which reads as deep
+	// shadow rather than a rendering error.
+	visibility = max(0.08, visibility);
 
 	return float2(visibility, vPos.z);
 }
@@ -369,10 +391,28 @@ PS_OUTPUT PS(const VS_OUTPUT i, uniform int SLICES, uniform int STEPS, uniform f
 
 float4 PS_BLUR(const VS_OUTPUT i, uniform int GAUSS_KERNEL): SV_TARGET0 {
 	float ao = joinedBilateralGaussianBlur(i.pos.xy, GAUSS_KERNEL);
-	// No additional pow() here — contrast is already baked into GTAO_Value's
-	// FinalValuePower. The stock pow(ao, 3) was needed because hemisphere SSAO
-	// produced low-contrast output. GTAO's analytic integration doesn't need it.
-	return float4(ao, 0, 0, 1);
+
+	// V2: Contrast power curve applied AFTER blur, not before.
+	//
+	// Pipeline ordering:
+	//   GTAO_Value outputs raw visibility (0.08 – 1.0, gentle gradients)
+	//   → bilateral blur softens raw visibility (edge-aware averaging works well
+	//     on the gentle 0.3-0.5 range values that thin occluders produce)
+	//   → pow(ao, 1.5) adds contrast to the softened result
+	//
+	// This matches stock's ordering: raw SSAO → blur → pow(ao, 3).
+	// Stock needed pow(3) because hemisphere SSAO produced very low-contrast
+	// output. GTAO's analytic integration already produces meaningful contrast,
+	// so 1.5 is sufficient. XeGTAO reference default is 1.5 for outdoor/mixed.
+	//
+	// Effect on typical values (after blur):
+	//   0.8 (light occlusion) → 0.72  (subtle, natural)
+	//   0.5 (moderate)        → 0.35  (clearly visible shadow)
+	//   0.3 (heavy, e.g. intake) → 0.16 (dark but not black)
+	//
+	// Compare to V1's pow(2.5) applied before blur:
+	//   0.3 raw → pow(0.3, 2.5) = 0.05 → blur can't recover → near-black
+	return float4(pow(ao, 1.5), 0, 0, 1);
 }
 
 //=============================================================================
@@ -381,14 +421,17 @@ float4 PS_BLUR(const VS_OUTPUT i, uniform int GAUSS_KERNEL): SV_TARGET0 {
 // Pass structure:
 //   SSAO_1: Lower quality pass (4 slices × 4 steps = 32 depth reads)
 //   SSAO_2: Higher quality pass (5 slices × 5 steps = 50 depth reads)
-//   Blur_1, Blur_2: Bilateral gaussian blur passes (unchanged)
+//   Blur_1, Blur_2: Bilateral gaussian blur passes (with post-blur contrast)
 //
-// DIST_FACTOR controls how the AO radius scales with distance for external
-// (non-cockpit) geometry. Higher = larger AO on distant objects.
+// V2: DIST_FACTOR reduced from 4.0 to 3.0 (matches stock).
+// This tightens the shadow spread around small features (pylons, blades,
+// antennae) without reducing the distance at which AO is visible.
+// The sqrt(distance) scaling in aoRadius still ensures AO remains visible
+// at range — DIST_FACTOR only controls shadow WIDTH, not shadow RANGE.
 //
 // Compare to stock:
-//   Stock SSAO_1: 64 hemisphere samples = 64 depth reads
-//   Stock SSAO_2: 128 hemisphere samples = 128 depth reads
+//   Stock SSAO_1: 64 hemisphere samples = 64 depth reads, DIST_FACTOR 3.0
+//   Stock SSAO_2: 128 hemisphere samples = 128 depth reads, DIST_FACTOR 3.0
 //   GTAO SSAO_1: 4×4 = 32 depth reads (2x fewer, better quality)
 //   GTAO SSAO_2: 5×5 = 50 depth reads (2.5x fewer, significantly better quality)
 //=============================================================================
@@ -402,11 +445,11 @@ float4 PS_BLUR(const VS_OUTPUT i, uniform int GAUSS_KERNEL): SV_TARGET0 {
 technique10 SSAO {
 	//                          Slices, Steps, DistFactor
 	pass SSAO_1	{
-		SetPixelShader(CompileShader(ps_5_0, PS(4, 4, 4.0)));
+		SetPixelShader(CompileShader(ps_5_0, PS(4, 4, 3.0)));
 		COMMON_PART
 	}
 	pass SSAO_2 {
-		SetPixelShader(CompileShader(ps_5_0, PS(5, 5, 4.0)));
+		SetPixelShader(CompileShader(ps_5_0, PS(5, 5, 3.0)));
 		COMMON_PART
 	}
 	pass Blur_1	{
