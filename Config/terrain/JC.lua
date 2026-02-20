@@ -1,38 +1,53 @@
 -- =============================================================================
--- JC Opus Terrain Configuration
--- Physically-grounded visibility: 80km atmospheric ceiling, 20/20 acuity
--- Terrain LOD distances optimized for 5-25km slant range visual fidelity
--- Based on High.lua with extended distances and detail parameters
+-- JC Opus View Distance: Terrain Distance Configuration
+-- Physically-grounded: 80km atmospheric ceiling, 120km atmFarDistance
+--
+-- Based on Extreme/Insane with targeted improvements:
+-- - mapLodDistance0-3 pushed out (stock never scales these; they're 2/4/6/8 at ALL levels)
+-- - district/uniqueScene at Insane-level distances
+-- - water/subforest/beach/road blend matched to Insane (80km atmo limit)
+-- - land_detailNoise.Height at Insane level (1500m)
+-- - noise1back/noise1top at Insane level
 -- =============================================================================
 
 distance =
 {
-	distance10x10 = 200000.0;      -- was 140000; extended for 80km visibility ceiling
-	distanceLevel0 = 200000.0;     -- was 140000; match distance10x10
-	uniqueSceneFarDistance = 30000.0;  -- was 20000; pushed to 30km for approach/departure range
-	smokesSceneFarDistance = 30000.0;  -- was 20000; match uniqueScene
+	distance10x10 = 140000.0;          -- constant across all levels
+	distanceLevel0 = 140000.0;         -- constant across all levels
+	uniqueSceneFarDistance = 45000.0;   -- Low:10k High:20k Extreme:30k Insane:60k -> 45k
+	smokesSceneFarDistance = 45000.0;   -- matched to uniqueScene
 	minimalSquareOnScreen = 50;
 	minimalSquareOnScreenFull = 100;
 	
-	mapLodDistance0 = 3000;         -- was 2000; pushed for higher detail at cruise altitude
-	mapLodDistance1 = 6000;         -- was 4000
-	mapLodDistance2 = 10000;        -- was 6000
-	mapLodDistance3 = 14000;        -- was 8000
-	smallShitDimention = 8000;     -- was 4000; doubled for ground detail visibility
+	-- These are 2/4/6/8k at EVERY stock level including Insane. ED never tuned them.
+	-- Pushing these out is the single biggest lever for terrain mesh detail at altitude.
+	-- These control which terrain mesh LOD ring is active at what camera distance.
+	mapLodDistance0 = 3000;             -- was 2000 at all levels: +50%
+	mapLodDistance1 = 6000;             -- was 4000 at all levels: +50%
+	mapLodDistance2 = 10000;            -- was 6000 at all levels: +67%
+	mapLodDistance3 = 14000;            -- was 8000 at all levels: +75%
+	smallShitDimention = 4000;          -- same as High/Extreme/Insane
 }
 distanceBlend = 
 {
+	-- town/field: constant across all levels, keep them
 	townNearDistance  = 80000.0;
 	townFarDistance   = 120000.0;
 	fieldNearDistance = 40000.0;
 	fieldFarDistance  = 140000.0;
-	waterNearDistance = 40000.0;    -- was 30000; pushed for water visibility at altitude
-	waterFarDistance  = 60000.0;    -- was 40000
-	townLightNearDistance  = 15000.0;  -- was 10000; lights visible further
-	townLightFarDistance  = 30000.0;   -- was 20000
-	subforest = {30000, 60000};    -- was {20000, 40000}; extended for terrain detail
-	beach = {30000, 60000};        -- was {20000, 40000}
-	road = {30000, 60000};         -- was {20000, 40000}
+
+	-- water: match Insane (Low:20/30 High:30/40 Extreme:40/80 Insane:60/120)
+	waterNearDistance = 60000.0;
+	waterFarDistance  = 120000.0;
+
+	-- lights: constant across all levels
+	townLightNearDistance  = 10000.0;
+	townLightFarDistance  = 20000.0;
+
+	-- match Insane (all max out at 80k far, capped by atmosphere)
+	subforest = {20000, 80000};
+	beach = {30000, 80000};
+	road = {30000, 80000};
 }
 
 --Old Noise 
@@ -41,8 +56,10 @@ land_noise =
 	noisemin = 0.0;
 	noisemax = 0.6;
 	noise1front = 1000.0;
-	noise1back = 80000.0;          -- was 60000; pushed to 80km atmospheric ceiling
-	noise1top = 12000.0;           -- was 10000; maintain noise at higher altitudes
+	-- Low:40k High:60k Extreme:80k Insane:120k -> match Insane
+	noise1back = 120000.0;
+	-- Low:8k High:10k Extreme:12k Insane:18k -> match Insane
+	noise1top = 18000.0;
 	noise1bottom = 2000.0;
 	noise1PerSquare = 2.0;
 	noise2PerSquare = 150.0;
@@ -50,7 +67,8 @@ land_noise =
 
 land_detailNoise=
 {
-	Height = 600.0;                -- was 500; increased for ground detail fidelity
+	-- Low:300 High:500 Extreme:700 Insane:1500 -> match Insane
+	Height = 1500.0;
 	Slope = 0.0;	
 }
 
@@ -58,10 +76,13 @@ district =
 {
 	maxDistrictsAround = 100000;
 
-	farDistance = 40000.0;          -- was 30000; pushed for 5-25km slant range
-	farFullRenderDistance = 30000.0; -- was 20000
-	nearFullRenderDistance = 5000.0; -- was 3000
-	nearDistance = 5000.0;          -- was 3000; match nearFullRenderDistance
+	-- Low:13k High:30k Extreme:50k Insane:80k -> match Insane
+	farDistance = 80000.0;
+	-- Low:10k High:20k Extreme:30k Insane:60k -> match Insane
+	farFullRenderDistance = 60000.0;
+	-- Low:1k High:3k Extreme:5k Insane:8k -> match Insane
+	nearFullRenderDistance = 8000.0;
+	nearDistance = 8000.0;
 	
 -- These tree values seem to be obsolete (they don't do anything)
 	treesFarDistance = 1500.0;
@@ -72,7 +93,7 @@ district =
 	heightRandomFactor = 0;
 	ajastfactor = 1;
 	
-	lampFarDistance = 15000;        -- was 10000; lights visible further out
+	lampFarDistance = 10000;
 	splineBlockFarDistance = 500.0;
 
 --	renderType = "texture"; -- simple, texture, instance
@@ -85,13 +106,13 @@ district =
 		staticSize = 4.0;
 		spriteScale = 0.001;
 		minDistance = 150.0;
-		maxDistance = 15000.0;      -- was 10000; match lampFarDistance
+		maxDistance = 10000.0;
 		maxAlphaDistance = 400.0;
 		minAlphaDistance = 0.0;
 		minAlpha = 0.0;
 		maxAlpha = 1.0;
 		minBrightnessDistance = 0.0;
-		maxBrightnessDistance = 15000.0;	-- must be <= lampFarDistance
+		maxBrightnessDistance = 10000.0;	-- must be <= lampFarDistance	
 		dsLightRadius = 60;
 		dsLightBrightness = 4;
 	};
@@ -100,13 +121,13 @@ district =
 flat_shadow =
 {
 	farDistance = 1500.0; -- doesn't do anything
-	fullFarDistance = 0.0; -- doesn't do anything
+	fullFarDistance = 0.0; -- doesn't do anything 
 }
 
 fog =
 {
 	front = 1000.0;
-	back  = 80000.0;               -- was 70000; pushed to 80km atmospheric ceiling
+	back  = 70000.0;     -- constant across all levels
 }
 
 layerfog =
@@ -131,10 +152,10 @@ noise =
 	noiseStartDistance = 3000.0;
 	noiseEndDistance = 200.0;
 	noiseMaxBlend = 0.7;
-	noiseScale = 120.0;            -- was 90.0; increased for texture detail at altitude
+	noiseScale = 90.0;  --15.0 (Low uses 15; High/Extreme/Insane all use 90)
 	rampNoisePower = 0.8;
 	rampNoiseScale = 17.0;
-	smallNoiseStartDistance = 400.0; -- was 200.0; extended for close-range ground detail
+	smallNoiseStartDistance = 200.0;
 	smallNoiseEndDistance = 1.0;
 	smallNoiseMaxBlend = 0.5;
 	smallNoiseScale = 450.0;		
@@ -147,13 +168,13 @@ lamp31 =
 	staticSize = 4.0;
 	spriteScale = 0.001;
 	minDistance = 150.0;
-	maxDistance = 15000.0;          -- was 10000; extended lamp visibility
+	maxDistance = 10000.0;
 	maxAlphaDistance = 400.0;
 	minAlphaDistance = 0.0;
 	minAlpha = 0.0;
 	maxAlpha = 1.0;
 	minBrightnessDistance = 0.0;
-	maxBrightnessDistance = 15000.0; -- was 10000
+	maxBrightnessDistance = 10000.0;
 	dsLightRadius = 60;
 	dsLightBrightness = 4;
 }
@@ -168,10 +189,10 @@ lamp =
 	maxDistance = 3385.0;
 	maxAlphaDistance = 1300.0;
 	minAlphaDistance = 250.0;
-	minAlpha = 0.0; --0.36
-	maxAlpha = 1.0; --0.26
+	minAlpha = 0.0;
+	maxAlpha = 1.0;
 	minBrightnessDistance = 0.0;
-	maxBrightnessDistance = 30000.0; -- was 24000; pushed for lamp brightness at distance
+	maxBrightnessDistance = 24000.0; 
 }
 
 fan = 
@@ -187,52 +208,10 @@ fan =
 	frequency = 15;
 };
 
---hiddensemantics={0, 2, 5, 7, 9, 23, 26};
-hiddensemantics={
---	"Sea",
---	"Lake", 
---	"Island",
---	"Land",
---	"Field",
---	"Beach",
---	"Plant",
---	"Town",
---	"River",
---	"Channel",
---	"Road",
---	"Rail",
---	"Runway",
---	"Building",
---	"ELT",
---	"SmallShit",
---	"Trees",
---	"Lamp",
-	};
-hiddenlayer={
---	0,
---	1,
---	2, 
---	3, 
---	4, 
---	5, 
---	6, 
---	18,
---	19,		-- flat_shadows		
---	20,		-- houses
---	21,		-- trees
---	22,		-- pole
---	23,		-- lights
---	24
-};
-hiddenlevels={
---	0, 
---	1, 
---	2
-	};
-hiddencameras={
---	0, --near, 
---	1, --far
-	};
+hiddensemantics={};
+hiddenlayer={};
+hiddenlevels={};
+hiddencameras={};
 debug = 
 {
 	switchoffDrawRoutine = 0;
