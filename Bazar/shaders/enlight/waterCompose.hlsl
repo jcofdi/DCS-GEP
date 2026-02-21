@@ -62,8 +62,18 @@ float4 getReflectionDistorsionColor(float2 uv, float3 normal, float distance) {
 		r = lerp(r, r1, step(r.w, r1.w));
 	}
 
-	float f = (0.001 + distance * 0.001) * 0.5;	// gDev0.x
-	float2 d = normalize(float2(normal.xz)) * r.w  * f;
+	// [MOD] Issue 8 follow-up: Cap distortion offset growth at distance.
+	// With the Issue 8 fix, 'distance' is real world-space meters instead of ~1.0.
+	// The original linear formula caused the scatter loop to skip across the
+	// reflection texture at large distances, producing vertical streaks and
+	// cross-hatch patterns. A square-root ramp preserves near-field detail
+	// while preventing far-field explosion.
+	//
+	//   At   10m: sqrt(10)  * 0.0005 ≈ 0.0016  (similar to old constant ~0.001)
+	//   At  100m: sqrt(100) * 0.0005 ≈ 0.005   (was 0.051 — 10× smaller)
+	//   At 5000m: sqrt(5000)* 0.0005 ≈ 0.035   (was 2.50  — 70× smaller)
+	float f = sqrt(max(distance, 1.0)) * 0.0005;
+	float2 d = normalize(float2(normal.xz)) * r.w * f;
 
 	float4 rcolor = float4(r.xyz*r.w, r.w);
 	[unroll]
