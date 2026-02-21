@@ -11,10 +11,12 @@
 #define BASE_SHADOWMAP_SIZE 4096
 #define BASE_SHADOWMAP_BIAS 0.0004
 
-// Fraction of each split distance used as the dither transition zone.
-// 0.10 = 10% of the split boundary. Wider = smoother but more double-sampling.
-// At the critical 1->2 boundary (55m with our splits), this means a ~5.5m zone.
-#define CASCADE_BLEND_ZONE 0.10
+// Fixed world-space width (in meters) for the dither transition zone between
+// adjacent shadow cascades. Using a fixed width instead of a percentage of the
+// split distance prevents visible banding when cascade splits are pushed far out.
+// 5m is wide enough for smooth IGN dithering but narrow enough to be invisible
+// at any altitude.
+static const float DITHER_WIDTH = 5.0;
 
 #if USE_ROTATE_PCF
 float rnd(float2 xy) {
@@ -110,10 +112,10 @@ float SampleShadowCascade(float3 wPos, float depth, float3 normal, uniform bool 
 			return SampleShadowMap(wPos, NoL, 0, usePCF, samplesMax, useTreeShadow);
 
 		// --- Dithered transition: Cascade 0 -> 1 ---
-		float z01 = ShadowDistance[0] * (1.0 + CASCADE_BLEND_ZONE);
+		float z01 = ShadowDistance[0] + DITHER_WIDTH;
 		if (depth > ShadowDistance[1]) {
 			if (depth < z01) {
-				float t = (depth - ShadowDistance[0]) / (z01 - ShadowDistance[0]);
+				float t = (depth - ShadowDistance[0]) / DITHER_WIDTH;
 				return (noise > t)
 					? SampleShadowMap(wPos, NoL, 0, usePCF, samplesMax, useTreeShadow)
 					: SampleShadowMap(wPos, NoL, 1, usePCF, samplesMax, useTreeShadow);
@@ -122,10 +124,10 @@ float SampleShadowCascade(float3 wPos, float depth, float3 normal, uniform bool 
 		}
 
 		// --- Dithered transition: Cascade 1 -> 2 (formation flight critical zone) ---
-		float z12 = ShadowDistance[1] * (1.0 + CASCADE_BLEND_ZONE);
+		float z12 = ShadowDistance[1] + DITHER_WIDTH;
 		if (depth > ShadowDistance[2]) {
 			if (depth < z12) {
-				float t = (depth - ShadowDistance[1]) / (z12 - ShadowDistance[1]);
+				float t = (depth - ShadowDistance[1]) / DITHER_WIDTH;
 				return (noise > t)
 					? SampleShadowMap(wPos, NoL, 1, usePCF, samplesMax, useTreeShadow)
 					: SampleShadowMap(wPos, NoL, 2, usePCF, samplesMax, useTreeShadow, 2.5);
@@ -134,10 +136,10 @@ float SampleShadowCascade(float3 wPos, float depth, float3 normal, uniform bool 
 		}
 
 		// --- Dithered transition: Cascade 2 -> 3 ---
-		float z23 = ShadowDistance[2] * (1.0 + CASCADE_BLEND_ZONE);
+		float z23 = ShadowDistance[2] + DITHER_WIDTH;
 		if (depth > ShadowDistance[3]) {
 			if (depth < z23) {
-				float t = (depth - ShadowDistance[2]) / (z23 - ShadowDistance[2]);
+				float t = (depth - ShadowDistance[2]) / DITHER_WIDTH;
 				float hiRes = SampleShadowMap(wPos, NoL, 2, usePCF, samplesMax, useTreeShadow, 2.5);
 				float loRes;
 				if (useTreeShadow)
