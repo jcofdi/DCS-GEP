@@ -265,25 +265,33 @@ float3 calcWaterColor(float3 wPos, float waterDepth, float3 N, float2 reflection
 	
 	float L = length(ocean::camera.xyz - wPos);
 
+	// [MOD] Distance-based mip bias for bump map sampling.
+	// Ramps from 0 at near distances to ~6-7 at the horizon.
+	// The divisor 10.0 sets the near-distance threshold (meters) below which
+	// mipBias stays at 0 (full detail); beyond that it grows logarithmically.
+	// Prevents bump aliasing that causes vertical streaks when combined with
+	// physically-correct Fresnel (which no longer dampens grazing-angle reflections).
+	float mipBias = clamp(log2(max(1.0, L / 10.0)), 0.0, 7.0);
+
 	float4 tmp = mul(float4(wPos, 1.0), ocean::HeightMatrix);
 	tmp = 0.5f * tmp + 0.5f;
 	tmp.y = 1.0f - tmp.y;
 	
 	float2 bumpOffset = N.xz / 20.0;
 
-	float3 bump = ocean::BumpMap.Sample(WrapSampler, worldPos.xz / 15.0 + bumpOffset) +
-		ocean::BumpMap.Sample(WrapSampler, worldPos.xz / 10.0 + bumpOffset) +
-		ocean::BumpMap.Sample(WrapSampler, worldPos.xz / 20.0 + bumpOffset);
+	float3 bump = ocean::BumpMap.SampleLevel(WrapSampler, worldPos.xz / 15.0 + bumpOffset, mipBias) +
+		ocean::BumpMap.SampleLevel(WrapSampler, worldPos.xz / 10.0 + bumpOffset, mipBias) +
+		ocean::BumpMap.SampleLevel(WrapSampler, worldPos.xz / 20.0 + bumpOffset, mipBias);
 
 	N.xz = N.xz + 0.6 * normalize((bump / 3.0 - 0.5) * 2.0).xz;
 
-	bump = ocean::BumpMap.Sample(WrapSampler, worldPos.xz / 5.0 + bumpOffset);
+	bump = ocean::BumpMap.SampleLevel(WrapSampler, worldPos.xz / 5.0 + bumpOffset, mipBias);
 	N.xz = N.xz * 0.8 + normalize((bump - 0.5) * 2.0).xz * 0.2 * ocean::windFactor;
 
 	N = normalize(N);
 
-	float3 hBump = (ocean::BumpMap.Sample(WrapSampler, (worldPos.xz + ocean::windOffset) / 170.0) +
-		ocean::BumpMap.Sample(WrapSampler, (worldPos.xz + ocean::windOffset) / 1111.0))*0.5;
+	float3 hBump = (ocean::BumpMap.SampleLevel(WrapSampler, (worldPos.xz + ocean::windOffset) / 170.0, mipBias) +
+		ocean::BumpMap.SampleLevel(WrapSampler, (worldPos.xz + ocean::windOffset) / 1111.0, mipBias))*0.5;
 
 	N = normalize(N + normalize((hBump - 0.5) * 2.0) * (0.25 + ocean::windFactor));
 
