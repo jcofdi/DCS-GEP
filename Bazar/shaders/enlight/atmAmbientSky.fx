@@ -32,15 +32,15 @@
 //    SampleSky2, the ground term is reduced by 3.14x, so the increased
 //    transparency does not risk over-brightening.
 //
-// 4. ComputeAerialTransmittance — Reduced aerial perspective for clouds
+// 4. ComputeAerialTransmittance — Distance-dependent aerial perspective
 //    [ORIGINAL] inscatter at full strength, transmittance unmodified
-//    [MOD]      cloudAerialFactor = 0.5 applied to both
+//    [MOD]      cloudAerialFactor ramps from 0.25 (near) to 0.90 (far)
 //    RATIONALE: Clouds are part of the atmosphere, not solid objects in
-//    front of it. The raymarcher already integrates atmospheric scattering
-//    within the cloud volume. Full camera-to-cloud aerial perspective
-//    double-counts the atmospheric contribution, producing excessively
-//    blue distant clouds. Both inscatter and transmittance are reduced
-//    proportionally to maintain energy balance.
+//    front of it. Near clouds have most of their atmospheric column inside
+//    the cloud volume (already handled by raymarcher), so aerial perspective
+//    is mostly redundant. Far clouds have a long clear-air column where
+//    aerial perspective IS physically legitimate and needed for natural
+//    horizon haze integration and draw-distance fade.
 //
 // =============================================================================
 
@@ -451,32 +451,38 @@ void ComputeAerialTransmittance(uint id: SV_GroupIndex, uint3 gId: SV_GroupID, u
 	float3 transmittance;
 	float3 inscatterColor = GetSkyRadianceToPoint(cameraPos, cameraPos + i.dir * i.dist*0.001, 0.0/*shadow*/, gSunDir, transmittance);
 
-	// [MOD] Reduce aerial perspective applied to volumetric clouds.
+	// [MOD] Distance-dependent aerial perspective for volumetric clouds.
 	//
-	// Volumetric clouds are not solid objects sitting in front of clear
-	// atmosphere — they ARE part of the atmosphere. The C++ raymarcher already
-	// integrates atmospheric scattering within the cloud volume. Applying the
-	// full camera-to-cloud inscatter on top of that double-counts the
-	// atmospheric contribution along the cloud column.
+	// PHYSICAL MODEL:
+	// For a cloud at distance D with thickness T (~2km for cumulus), the
+	// atmospheric column between camera and cloud has two parts:
+	//   1. Clear atmosphere (D - T): aerial perspective IS legitimate here
+	//   2. Cloud volume (T): raymarcher already handles internal scattering
 	//
-	// At distance, this causes clouds to converge toward sky color (blue)
-	// because transmittance -> 0 dims the cloud's own color while inscatter
-	// -> sky radiance replaces it. Undersides are most affected since their
-	// darker base color is overwhelmed by inscatter sooner than bright tops.
+	// Applying full camera-to-cloud aerial perspective double-counts the
+	// contribution within the cloud volume. The correct reduction factor is
+	// approximately (D - T) / D, but the raymarcher's internal scattering
+	// doesn't perfectly match Bruneton's single-scatter model, so we use a
+	// conservative smoothstep ramp that:
 	//
-	// Both inscatter and transmittance are reduced proportionally to maintain
-	// energy balance. Reducing only inscatter would make distant clouds too
-	// bright; reducing only transmittance would make them too dark.
+	//   Near (< 5km):  factor ~0.25  — cloud volume dominates path, most
+	//                                   aerial perspective is redundant
+	//   Mid (20-30km): factor ~0.50  — balanced, preserves cloud color while
+	//                                   allowing natural haze development
+	//   Far (50-60km): factor ~0.80  — clear atmosphere dominates, legitimate
+	//                                   haze needed for depth integration
+	//   Draw limit:    factor ~0.90  — clouds fade smoothly into sky color,
+	//                                   masking the C++ draw distance cutoff
 	//
-	// Factor 0.5 = clouds "replace" roughly half the atmosphere in their
-	// column on average. Tune range: 0.3 (minimal aerial perspective) to
-	// 0.7 (mostly standard). At 0.5, a cloud at 30km retains significantly
-	// more of its own color instead of fading to sky blue.
+	// This also solves the horizon contrast problem: with a flat factor,
+	// distant clouds retained too much of their own color and popped against
+	// sun-lit haze. The ramp allows them to naturally blend into the horizon.
 	//
 	// [ORIGINAL]
 	// tex3DOutput[dId.xyz] = float4(inscatterColor * gAtmIntensity, 0);
 	// tex3DOutput2[dId.xyz] = float4(transmittance, 0);
-	static const float cloudAerialFactor = 0.5;
+	float distKm = i.dist * 0.001;
+	float cloudAerialFactor = lerp(0.25, 0.90, smoothstep(5.0, 60.0, distKm));
 	tex3DOutput[dId.xyz]  = float4(inscatterColor * gAtmIntensity * cloudAerialFactor, 0);
 	tex3DOutput2[dId.xyz] = float4(lerp(1.0, transmittance, cloudAerialFactor), 0);
 }
