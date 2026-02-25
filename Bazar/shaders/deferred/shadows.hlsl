@@ -11,13 +11,6 @@
 #define BASE_SHADOWMAP_SIZE 4096
 #define BASE_SHADOWMAP_BIAS 0.0004
 
-// Fixed world-space width (in meters) for the dither transition zone between
-// adjacent shadow cascades. Using a fixed width instead of a percentage of the
-// split distance prevents visible banding when cascade splits are pushed far out.
-// 5m is wide enough for smooth IGN dithering but narrow enough to be invisible
-// at any altitude.
-static const float DITHER_WIDTH = 5.0;
-
 #if USE_ROTATE_PCF
 float rnd(float2 xy) {
 	return frac(sin(dot(xy, float2(12.9898, 78.233))) * 43758.5453);
@@ -50,7 +43,7 @@ float SampleShadowMap(float3 wPos, float NoL, uniform uint idx, uniform bool use
 		float angle = 0, offset = 0;;
 #if USE_ROTATE_PCF
 		float4 projPos = mul(float4(wPos, 1.0), gViewProj);
-		angle += rnd(projPos.xy / projPos.w);  // pseudo-random rotation — sin-hash is correct here
+		angle += rnd(projPos.xy/ projPos.w);
 #endif
 		[unroll(count)]
 		for (uint i = 1; i < count; ++i) {
@@ -100,61 +93,67 @@ float SampleShadowCascade(float3 wPos, float depth, float3 normal, uniform bool 
 	if (useOnlyFirstMap) {
 		return SampleShadowMap(wPos, NoL, ShadowFirstMap, usePCF, samplesMax, false);
 	} else {
-		// === IGN dither for cascade transitions ===
-		// Project to screen space once for the noise coordinate
-		float4 projPos = mul(float4(wPos, 1.0), gViewProj);
-		float2 screenPos = (projPos.xy / projPos.w) * 0.5 + 0.5;
-		float2 pixelPos = screenPos * gSreenParams.xy;
-		float noise = interleavedGradientNoise(pixelPos);
+		// Derive stable screen-space pixel coordinates from wPos via the
+		// view-projection matrix already available in this scope. This
+		// avoids threading SV_POSITION through the entire call chain.
+		float4 _clipPos = mul(float4(wPos, 1.0), gViewProj);
+		float2 _ndc = _clipPos.xy / _clipPos.w;
+		float2 _pixelPos = (float2(_ndc.x, -_ndc.y) * 0.5 + 0.5) * float2(gScreenSize);
+		float _noise = interleavedGradientNoise(_pixelPos);
 
-		// Cascade 0 (farthest = highest depth value boundary)
+		// Transition half-width in depth units per cascade boundary.
+		// 2.5% of cascade depth — wide enough to dissolve the seam,
+		// narrow enough to avoid visibly blurring shadow detail.
+		#define CASCADE_TRANS_FRAC 0.025
+
+		// Cascade 0 (farthest) — beyond all shadow maps
 		if (depth > ShadowDistance[0])
 			return SampleShadowMap(wPos, NoL, 0, usePCF, samplesMax, useTreeShadow);
 
-		// --- Dithered transition: Cascade 0 -> 1 ---
-		float z01 = ShadowDistance[0] + DITHER_WIDTH;
+		// Cascade 0→1 transition
 		if (depth > ShadowDistance[1]) {
-			if (depth < z01) {
-				float t = (depth - ShadowDistance[0]) / DITHER_WIDTH;
-				return (noise > t)
-					? SampleShadowMap(wPos, NoL, 0, usePCF, samplesMax, useTreeShadow)
-					: SampleShadowMap(wPos, NoL, 1, usePCF, samplesMax, useTreeShadow);
+			float tw = ShadowDistance[1] * CASCADE_TRANS_FRAC;
+			float edge = ShadowDistance[1] + tw;
+			if (depth < edge) {
+				float t = (edge - depth) / tw;
+				return SampleShadowMap(wPos, NoL, (_noise < t) ? 1 : 0, usePCF, samplesMax, useTreeShadow);
 			}
 			return SampleShadowMap(wPos, NoL, 1, usePCF, samplesMax, useTreeShadow);
 		}
 
-		// --- Dithered transition: Cascade 1 -> 2 (formation flight critical zone) ---
-		float z12 = ShadowDistance[1] + DITHER_WIDTH;
+		// Cascade 1→2 transition
 		if (depth > ShadowDistance[2]) {
-			if (depth < z12) {
-				float t = (depth - ShadowDistance[1]) / DITHER_WIDTH;
-				return (noise > t)
-					? SampleShadowMap(wPos, NoL, 1, usePCF, samplesMax, useTreeShadow)
-					: SampleShadowMap(wPos, NoL, 2, usePCF, samplesMax, useTreeShadow, 2.5);
+			float tw = ShadowDistance[2] * CASCADE_TRANS_FRAC;
+			float edge = ShadowDistance[2] + tw;
+			if (depth < edge) {
+				float t = (edge - depth) / tw;
+				uint idx = (_noise < t) ? 2 : 1;
+				return SampleShadowMap(wPos, NoL, idx, usePCF, samplesMax, useTreeShadow, idx == 2 ? 2.5 : 3.0);
 			}
 			return SampleShadowMap(wPos, NoL, 2, usePCF, samplesMax, useTreeShadow, 2.5);
 		}
 
-		// --- Dithered transition: Cascade 2 -> 3 ---
-		float z23 = ShadowDistance[2] + DITHER_WIDTH;
+		// Cascade 2→3 transition (outermost, includes stock fade-to-1)
 		if (depth > ShadowDistance[3]) {
-			if (depth < z23) {
-				float t = (depth - ShadowDistance[2]) / DITHER_WIDTH;
-				float hiRes = SampleShadowMap(wPos, NoL, 2, usePCF, samplesMax, useTreeShadow, 2.5);
-				float loRes;
-				if (useTreeShadow)
-					loRes = max(SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, true, 2), smoothstep(ShadowDistance[2], ShadowDistance[3], depth));
-				else
-					loRes = max(SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, false, 2), smoothstep(ShadowCascadeFadeDepth, ShadowDistance[3], depth));
-				return (noise > t) ? hiRes : loRes;
-			}
+			float tw = ShadowDistance[3] * CASCADE_TRANS_FRAC;
+			float edge = ShadowDistance[3] + tw;
 
-			// Past the dither zone — cascade 3 with its existing smoothstep fade
+			// Stock outermost fade behavior preserved exactly
+			float shadow3;
 			if (useTreeShadow)
-				return max(SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, true, 2), smoothstep(ShadowDistance[2], ShadowDistance[3], depth));
+				shadow3 = max(SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, true, 2), smoothstep(ShadowDistance[2], ShadowDistance[3], depth));
 			else
-				return max(SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, false, 2), smoothstep(ShadowCascadeFadeDepth, ShadowDistance[3], depth));
+				shadow3 = max(SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, false, 2), smoothstep(ShadowCascadeFadeDepth, ShadowDistance[3], depth));
+
+			if (depth < edge) {
+				float t = (edge - depth) / tw;
+				if (_noise < t)
+					return SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, useTreeShadow, 2);
+			}
+			return shadow3;
 		}
+
+		#undef CASCADE_TRANS_FRAC
 		return 1;
 	}
 }	
