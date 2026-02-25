@@ -46,12 +46,43 @@ EnvironmentIrradianceSample SampleEnvironmentIrradianceApprox(float3 pos, float 
 
 	EnvironmentIrradianceSample o;
 	o.skyIrradiance	= GetSkyIrradiance(OriginSpaceToAtmosphereSpace(pos), gSunDir) * (cloudsAO * (gSunIntensity / atmPI));
-	
-	// ========== ORIGINAL DCS DESATURATION (RESTORED) ==========
-	o.skyIrradiance = lerp(o.skyIrradiance, dot(o.skyIrradiance, 0.33333), saturate(3.5 - 3.5*(cloudsAO*cloudsAO)));
-	// ========== END ORIGINAL CODE ==========
 
-	// Sandstorm color tinting
+	// [MOD] FIX #6 — Physically-calibrated sky irradiance desaturation under cloud cover.
+	//
+	// GetSkyIrradiance() returns clear-sky atmospheric irradiance from the Bruneton
+	// LUT — inherently blue-dominant from Rayleigh scattering. Under cloud cover,
+	// the true downwelling irradiance is a mix of:
+	//   - Open sky directions → blue Rayleigh-scattered light (what GetSkyIrradiance computes)
+	//   - Cloud-occupied directions → spectrally neutral Mie-scattered light (not modeled)
+	//
+	// The desaturation compensates for the missing cloud-base radiance contribution.
+	// The required spectral flattening is proportional to cloud hemisphere fraction.
+	//
+	// [ORIGINAL] saturate(3.5 - 3.5*(cloudsAO*cloudsAO))
+	// The original curve reached 100% desaturation at cloudsAO = 0.8 (light SCT),
+	// removing all blue sky character even when ~80% of the hemisphere is clear sky.
+	//
+	//   cloudsAO | Cloud frac | Original | This curve | Physical target
+	//   1.0      | 0%         | 0%       | 0%         | 0%
+	//   0.9      | ~10%       | 66%      | 5.5%       | ~10%
+	//   0.8      | ~20%       | 100%     | 12%        | ~20%
+	//   0.7      | ~30%       | 100%     | 19.5%      | ~30%
+	//   0.5      | ~50%       | 100%     | 37.5%      | ~50%
+	//   0.3      | ~70%       | 100%     | 59.5%      | ~70%
+	//   0.0      | 100%       | 100%     | 100%       | ~100%
+	//
+	// The curve cloudOcclusion * (0.5 + 0.5 * cloudOcclusion) tracks the physical
+	// target: gentle onset (even small cloud fraction contributes some neutral Mie
+	// light via the 0.5× base), accelerating toward full desaturation as cloud base
+	// increasingly dominates the hemisphere (0.5× cloudOcclusion added component).
+	//
+	// Boundary behavior: identity at cloudsAO=1.0 (clear sky), full desaturation
+	// at cloudsAO=0.0 (dense overcast). No change to clear-sky or overcast scenes.
+	float cloudOcclusion = saturate(1.0 - cloudsAO);
+	float desatAmount = cloudOcclusion * (0.5 + 0.5 * cloudOcclusion);
+	o.skyIrradiance = lerp(o.skyIrradiance, dot(o.skyIrradiance, 0.33333), desatAmount);
+
+	//takes sand storm color into account depending on eye altitude and dust density
 	bool bSandStorm = gFogParams.color.r != gFogParams.color.b;
 	if(bSandStorm)
 	{
@@ -67,11 +98,49 @@ EnvironmentIrradianceSample SampleEnvironmentIrradianceApprox(float3 pos, float 
 	return o;
 }
 
+// [MOD] FIX #7 — Inject horizon irradiance from the ambient cube as a third pole.
+//
+// The original SampleEnvironmentMapApprox uses a two-pole vertical blend:
+// up → skyIrradiance, down → surfaceIrradiance. For horizontal-facing normals
+// (vertical surfaces, object sides), it returns roughly the average of both poles.
+// Under cloud shadow, both poles are darkened by cloudsAO and shadow, so horizontal
+// normals receive the average of two dark values.
+//
+// Meanwhile, the ambient cube's side walls (AmbientAverageHorizon) already contain
+// the correct horizon brightness — rendered from the actual scene each frame. On a
+// partially cloudy day, the horizon is bright with scattered sunlight from distant
+// clear atmosphere and sunlit terrain. This data is physically correct by construction
+// and self-attenuates naturally: under overcast, the horizon walls also darken because
+// the rendered cubemap sees the same grey sky.
+//
+// The blend uses (1 - |ny|)² to weight the horizon contribution, peaking for
+// horizontal normals and falling to zero for pure up/down normals, avoiding
+// interference with the existing vertical poles. The 0.5 mix limit ensures the
+// horizon supplements rather than replaces the analytical model.
+//
+// [ORIGINAL] Two-pole blend only:
+//   return lerp(eis.surfaceIrradiance, eis.skyIrradiance, saturate(y*0.5+0.5))
+//        + float3(1e-3, 1e-4, 1e-5)*ny;
 float3 SampleEnvironmentMapApprox(EnvironmentIrradianceSample eis, float3 normal, float roughness = 1.0)
 {
 	const float ny = dot(gSurfaceNormal, normal);
 	const float y = ny * 10 - 9 * (1 - roughness * roughness);
-	return lerp(eis.surfaceIrradiance, eis.skyIrradiance, saturate(y*0.5+0.5)) + float3(1e-3, 1e-4, 1e-5)*ny;
+	float t = saturate(y * 0.5 + 0.5);
+
+	// Existing two-pole vertical blend (up = skyIrradiance, down = surfaceIrradiance)
+	float3 verticalIrradiance = lerp(eis.surfaceIrradiance, eis.skyIrradiance, t);
+
+	// Horizon contribution from actual ambient cube — strongest for horizontal normals.
+	// AmbientAverageHorizon is the average of the 4 side walls (+X, -X, +Z, -Z),
+	// already computed each frame in BuildAmbientCube and stored in AmbientMap[6].rgb.
+	// It naturally contains the correct brightness: bright on partially cloudy days
+	// (distant sunlit atmosphere), dim under overcast (rendered cubemap sees grey sky).
+	float horizonWeight = 1.0 - abs(ny);   // peaks at horizontal, zero at up/down
+	horizonWeight *= horizonWeight;          // sharpen falloff toward poles
+	float3 horizonIrradiance = AmbientAverageHorizon;
+
+	return lerp(verticalIrradiance, horizonIrradiance, horizonWeight * 0.5)
+		 + float3(1e-3, 1e-4, 1e-5) * ny;
 }
 
 float3 SampleEnvironmentMapApprox(float3 pos, float3 normal, float roughness = 1.0)
@@ -110,11 +179,7 @@ float3 atmApplyLinearDithered(float3 v, float distance, float3 color, float2 pix
 	// only 0.4% of the signal — completely invisible. The sweet spot where banding is
 	// perceptible (luminance ~0.01-0.1 in HDR) gets noise of 4-40% of one quantization
 	// step, which is enough to break the bands without adding visible grain.
-	// Luminance-adaptive amplitude: 0.001 peak (per documentation range),
-	// fading to zero below HDR luminance 0.01 where dither dominates signal.
-	float _ditherLum = dot(result, float3(0.2126, 0.7152, 0.0722));
-	float _ditherAmp = 0.001 * saturate(_ditherLum * 100.0);
-	result = ditherAtmosphericHDR(result, pixelPos, _ditherAmp);
+	result = ditherAtmosphericHDR(result, pixelPos, 0.004);
 	// ========== END ATMOSPHERIC DITHERING ==========
 	
 	return result;
