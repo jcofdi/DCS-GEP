@@ -48,7 +48,7 @@ static const float distMax = 1.5 * 1.5;//макс расстояние от ли
 // of along-track turbulence. Based on reference footage showing tight
 // lateral confinement with strong along-track shearing.
 // 0.4 = lateral turbulence at 40% of along-track strength.
-static const float lateralTurbulenceRatio = 0.4;
+static const float lateralTurbulenceRatio = 0.6;
 
 float DistToLine(float2 pt1, float2 pt2, float2 testPt)
 {
