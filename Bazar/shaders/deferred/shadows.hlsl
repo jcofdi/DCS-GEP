@@ -98,7 +98,7 @@ float SampleShadowCascade(float3 wPos, float depth, float3 normal, uniform bool 
 		// avoids threading SV_POSITION through the entire call chain.
 		float4 _clipPos = mul(float4(wPos, 1.0), gViewProj);
 		float2 _ndc = _clipPos.xy / _clipPos.w;
-		float2 _pixelPos = (float2(_ndc.x, -_ndc.y) * 0.5 + 0.5) * float2(gScreenSize);
+		float2 _pixelPos = (float2(_ndc.x, -_ndc.y) * 0.5 + 0.5) * 2048.0;
 		float _noise = interleavedGradientNoise(_pixelPos);
 
 		// Transition half-width in depth units per cascade boundary.
