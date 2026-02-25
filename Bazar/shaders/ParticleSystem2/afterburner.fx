@@ -46,7 +46,7 @@ static const float	alphaOpacity = 0.4;
 
 static const float	hotAirPower = 0.5;
 static const float	hotAirDistOffset = 10.0;
-static const float	hotAirDistMaxInv = 1.0 / 200.0;
+static const float	hotAirDistMaxInv = 1.0 / 100.0;
 
 static const float2 xLocal = {-0.13, 1.0};
 
