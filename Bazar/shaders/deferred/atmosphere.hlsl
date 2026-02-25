@@ -110,7 +110,11 @@ float3 atmApplyLinearDithered(float3 v, float distance, float3 color, float2 pix
 	// only 0.4% of the signal — completely invisible. The sweet spot where banding is
 	// perceptible (luminance ~0.01-0.1 in HDR) gets noise of 4-40% of one quantization
 	// step, which is enough to break the bands without adding visible grain.
-	result = ditherAtmosphericHDR(result, pixelPos, 0.004);
+	// Luminance-adaptive amplitude: 0.001 peak (per documentation range),
+	// fading to zero below HDR luminance 0.01 where dither dominates signal.
+	float _ditherLum = dot(result, float3(0.2126, 0.7152, 0.0722));
+	float _ditherAmp = 0.001 * saturate(_ditherLum * 100.0);
+	result = ditherAtmosphericHDR(result, pixelPos, _ditherAmp);
 	// ========== END ATMOSPHERIC DITHERING ==========
 	
 	return result;
