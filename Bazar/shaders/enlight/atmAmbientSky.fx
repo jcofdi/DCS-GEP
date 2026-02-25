@@ -34,13 +34,16 @@
 //
 // 4. ComputeAerialTransmittance — Distance-dependent aerial perspective
 //    [ORIGINAL] inscatter at full strength, transmittance unmodified
-//    [MOD]      cloudAerialFactor ramps from 0.25 (near) to 0.90 (far)
+//    [MOD]      cloudAerialFactor ramps from 0.35 (near) to 0.92 (far)
+//               using sqrt curve to avoid mid-range transition bunching
 //    RATIONALE: Clouds are part of the atmosphere, not solid objects in
 //    front of it. Near clouds have most of their atmospheric column inside
 //    the cloud volume (already handled by raymarcher), so aerial perspective
 //    is mostly redundant. Far clouds have a long clear-air column where
 //    aerial perspective IS physically legitimate and needed for natural
-//    horizon haze integration and draw-distance fade.
+//    horizon haze integration and draw-distance fade. Sqrt ramp establishes
+//    tint early then flattens, letting Bruneton's natural inscatter growth
+//    drive the mid-to-far progression smoothly.
 //
 // =============================================================================
 
@@ -463,26 +466,28 @@ void ComputeAerialTransmittance(uint id: SV_GroupIndex, uint3 gId: SV_GroupID, u
 	// contribution within the cloud volume. The correct reduction factor is
 	// approximately (D - T) / D, but the raymarcher's internal scattering
 	// doesn't perfectly match Bruneton's single-scatter model, so we use a
-	// conservative smoothstep ramp that:
+	// conservative ramp.
 	//
-	//   Near (< 5km):  factor ~0.25  — cloud volume dominates path, most
-	//                                   aerial perspective is redundant
-	//   Mid (20-30km): factor ~0.50  — balanced, preserves cloud color while
-	//                                   allowing natural haze development
-	//   Far (50-60km): factor ~0.80  — clear atmosphere dominates, legitimate
-	//                                   haze needed for depth integration
-	//   Draw limit:    factor ~0.90  — clouds fade smoothly into sky color,
-	//                                   masking the C++ draw distance cutoff
+	// CURVE SHAPE: sqrt (concave) rather than smoothstep (S-shaped).
+	// Bruneton inscatter itself grows nonlinearly with distance. An S-curve
+	// multiplied by that nonlinear growth concentrates the visual transition
+	// into a narrow mid-range band (~15-30km), producing an abrupt jump from
+	// neutral cloud to atmosphere-tinted cloud. A sqrt ramp rises quickly at
+	// short range (establishing baseline tint early) then flattens, letting
+	// Bruneton's natural distance falloff handle the gradual progression:
 	//
-	// This also solves the horizon contrast problem: with a flat factor,
-	// distant clouds retained too much of their own color and popped against
-	// sun-lit haze. The ramp allows them to naturally blend into the horizon.
+	//   3 km:   0.35  — nearby: strong reduction, raymarcher handles column
+	//   10 km:  0.52  — early tint established, no neutral-gray pop
+	//   20 km:  0.61  — mid-range: smooth progression
+	//   40 km:  0.74  — far: atmosphere asserting naturally
+	//   80 km:  0.91  — distant: near-stock, genuine haze column respected
 	//
 	// [ORIGINAL]
 	// tex3DOutput[dId.xyz] = float4(inscatterColor * gAtmIntensity, 0);
 	// tex3DOutput2[dId.xyz] = float4(transmittance, 0);
 	float distKm = i.dist * 0.001;
-	float cloudAerialFactor = lerp(0.25, 0.90, smoothstep(5.0, 60.0, distKm));
+	float _t = saturate((distKm - 3.0) / 80.0);
+	float cloudAerialFactor = lerp(0.35, 0.92, sqrt(_t));
 	tex3DOutput[dId.xyz]  = float4(inscatterColor * gAtmIntensity * cloudAerialFactor, 0);
 	tex3DOutput2[dId.xyz] = float4(lerp(1.0, transmittance, cloudAerialFactor), 0);
 }
