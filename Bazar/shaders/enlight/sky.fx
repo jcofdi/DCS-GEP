@@ -64,7 +64,10 @@ float4 PS(VS_OUTPUT i, uniform bool drawSunDisk): SV_TARGET0
 	// in the sky dome. This is the primary anti-banding measure — the tonemapper's
 	// Bayer dithering only operates post-gamma in a narrow luminance range and cannot
 	// fully compensate for banding that originates in the scattering LUT lookups.
-	skyColor = ditherAtmosphericHDR(skyColor, i.pos.xy, 0.004);
+	// Luminance-adaptive amplitude: matches atmosphere.hlsl fix.
+	float _ditherLum = dot(skyColor, float3(0.2126, 0.7152, 0.0722));
+	float _ditherAmp = 0.001 * saturate(_ditherLum * 100.0);
+	skyColor = ditherAtmosphericHDR(skyColor, i.pos.xy, _ditherAmp);
 	// ========== END SKY DITHERING ==========
 
 	if(drawSunDisk)
