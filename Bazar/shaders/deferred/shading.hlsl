@@ -15,8 +15,7 @@
 
 float modifyRoughnessByCloudShadow(float roughness, float cloudShadow)
 {
-	cloudShadow = 1 - cloudShadow;
-	return lerp(roughness, 0.99, cloudShadow * cloudShadow * 0.15);
+    return roughness;
 }
 
 float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1, 1), uniform uint selectEnvCube = LERP_ENV_MAP, float lerpEnvCubeFactor = 0, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), uniform bool insideCockpit = false)
