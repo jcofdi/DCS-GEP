@@ -30,6 +30,7 @@ Buffer<float>	miePhaseFunctionInput;
 Texture1D miePhaseFuncTex: register(t93);
 
 #include "atmDefinitions.hlsl"
+#include "atmARPCOverrides.hlsl"
 
 //#define USE_OZONE
 Texture2D deltaETex;	//irradiance tex
@@ -135,14 +136,14 @@ float3 WriteMiePhaseFunctionPS(float4 vPos: SV_POSITION0): SV_TARGET0
 
 float3 ComputeTransmittancePS(float4 vPos: SV_POSITION0): SV_TARGET0
 {
-	AtmosphereParameters atmParams; initAtmosphereParameters(atmParams);
+	AtmosphereParameters atmParams; initAtmosphereParametersARPC(atmParams);
 	return ComputeTransmittanceToTopAtmosphereBoundaryTexture(atmParams, vPos.xy);
 }
 
 float3 ComputeTransmittance3DPS(float4 vPos: SV_POSITION0): SV_TARGET0
 {
 #ifdef TRANSMITTANCE_VOLUME_TEXTURE
-	AtmosphereParameters atmParams; initAtmosphereParameters(atmParams);
+	AtmosphereParameters atmParams; initAtmosphereParametersARPC(atmParams);
 	return ComputeTransmittance3DTexture(atmParams, float3(vPos.xy, layer + 0.5));
 #else
 	return float3(1,0,0);
@@ -158,7 +159,7 @@ struct IRRADIANCE_OUTPUT
 IRRADIANCE_OUTPUT ComputeDirectIrradiancePS(float4 vPos: SV_POSITION0)
 {
 	IRRADIANCE_OUTPUT o;
-	AtmosphereParameters atmParams; initAtmosphereParameters(atmParams);
+	AtmosphereParameters atmParams; initAtmosphereParametersARPC(atmParams);
 #ifdef TRANSMITTANCE_3D
 	o.deltaIrradiance = float4(ComputeDirectIrradianceTexture3D(atmParams, transmittanceTex2, vPos.xy), 0);
 #else
@@ -178,7 +179,7 @@ struct SINGLE_SCATTERING_OUTPUT
 SINGLE_SCATTERING_OUTPUT ComputeSingleScatteringPS(float4 vPos: SV_POSITION0)
 {
 	SINGLE_SCATTERING_OUTPUT o;
-	AtmosphereParameters atmParams; initAtmosphereParameters(atmParams);
+	AtmosphereParameters atmParams; initAtmosphereParametersARPC(atmParams);
 #ifdef TRANSMITTANCE_3D
 	ComputeSingleScatteringTexture3D(atmParams, transmittanceTex2, float3(vPos.xy, layer + 0.5), o.deltaRayleigh.rgb, o.deltaMie.rgb);
 #else
@@ -190,7 +191,7 @@ SINGLE_SCATTERING_OUTPUT ComputeSingleScatteringPS(float4 vPos: SV_POSITION0)
 
 float3 ComputeScatteringDensityPS(float4 vPos: SV_POSITION0): SV_TARGET0
 {
-	AtmosphereParameters atmParams; initAtmosphereParameters(atmParams);
+	AtmosphereParameters atmParams; initAtmosphereParametersARPC(atmParams);
 #ifdef TRANSMITTANCE_3D
 	return ComputeScatteringDensityTexture3D(atmParams, transmittanceTex2, deltaSRTex, deltaSMTex, deltaMultipleScatteringTex,
 										   deltaETex, float3(vPos.xy, layer + 0.5), scatteringOrder);
@@ -203,7 +204,7 @@ float3 ComputeScatteringDensityPS(float4 vPos: SV_POSITION0): SV_TARGET0
 IRRADIANCE_OUTPUT ComputeIndirectIrradiancePS(float4 vPos: SV_POSITION0)
 {
 	IRRADIANCE_OUTPUT o;
-	AtmosphereParameters atmParams; initAtmosphereParameters(atmParams);
+	AtmosphereParameters atmParams; initAtmosphereParametersARPC(atmParams);
 	o.deltaIrradiance = float4(ComputeIndirectIrradianceTexture(atmParams, deltaSRTex, deltaSMTex, deltaMultipleScatteringTex, vPos.xy, scatteringOrder), 0);
 	o.irradiance = o.deltaIrradiance; //sum blending
 	return o;
@@ -218,7 +219,7 @@ struct MULTIPLE_SCATTERING_OUTPUT
 MULTIPLE_SCATTERING_OUTPUT ComputeMultipleScatteringPS(float4 vPos: SV_POSITION0)
 {
 	MULTIPLE_SCATTERING_OUTPUT o;
-	AtmosphereParameters atmParams; initAtmosphereParameters(atmParams);
+	AtmosphereParameters atmParams; initAtmosphereParametersARPC(atmParams);
 	float nu;
 #ifdef TRANSMITTANCE_3D
 	o.deltaMultipleScattering = float4(ComputeMultipleScatteringTexture3D(atmParams, transmittanceTex2, deltaJTex, float3(vPos.xy, layer + 0.5), nu), 0);
@@ -272,7 +273,7 @@ void ResolveScatteringCS(uint3 dId: SV_DispatchThreadID)
 	if(any(dId>=texSize))
 		return;	
 
-	AtmosphereParameters atmosphere; initAtmosphereParameters(atmosphere);	
+	AtmosphereParameters atmosphere; initAtmosphereParametersARPC(atmosphere);	
 	resolvedScattering[dId] = SampleScattering(atmosphere, dId, NdotL);
 }
 
@@ -440,7 +441,7 @@ float4 GetInterpolatedScattering(IN(AtmosphereParameters) atmosphere, IN(Abstrac
 
 float4 ComputeSkyRadiancePixel(uint3 id)
 {
-	AtmosphereParameters atmosphere; initAtmosphereParameters(atmosphere);
+	AtmosphereParameters atmosphere; initAtmosphereParametersARPC(atmosphere);
 
 	//посчитать начальные r, mu, muS, nu, d
 	bool bIntersectGround;
@@ -532,7 +533,7 @@ void ComputeSkyRadianceCS(uint3 dId: SV_DispatchThreadID)
 	float muWidth = blurWidth;
 	
 #if defined(LINEAR_MU) || defined(FLIP_MAPPING_MU)
-	AtmosphereParameters atmosphere; initAtmosphereParameters(atmosphere);
+	AtmosphereParameters atmosphere; initAtmosphereParametersARPC(atmosphere);
 	AtmPoint p0;
 	p0.mu_s = NdotL;
 	bool bIntersectGround;
