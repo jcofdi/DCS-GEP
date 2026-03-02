@@ -103,7 +103,7 @@ static const float adaptLumHigh      = 0.25;
 static const float highlightCompress = 0.0;
 static const float highlightKnee     = 0.75;
 static const float hybridBlendStart  = 0.45;
-static const float hybridBlendEnd    = 0.75;
+static const float hybridBlendEnd    = 0.90;
 
 // Applies post-curve reshaping: gamma correction, adaptive shadow recovery,
 // and highlight rolloff.

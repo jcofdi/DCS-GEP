@@ -50,24 +50,8 @@
 #include "common/stencil.hlsl"
 #include "common/context.hlsl"
 #include "deferred/Decoder.hlsl"
+#include "common/dithering.hlsl"
 
-// If your dithering.hlsl is available in the common path, uncomment this:
-// #include "common/dithering.hlsl"
-
-// Fallback IGN if dithering.hlsl isn't available at compile time.
-// This is identical to the interleavedGradientNoise in your dithering.hlsl.
-// If the include above works, you can remove this block.
-#ifndef DITHERING_HLSL
-float interleavedGradientNoise(float2 pixel, float frame)
-{
-	pixel += frame * float2(47.0, 17.0) * 0.695;
-	return frac(52.9829189 * frac(0.06711056 * pixel.x + 0.00583715 * pixel.y));
-}
-float interleavedGradientNoise(float2 pixel)
-{
-	return interleavedGradientNoise(pixel, 0.0);
-}
-#endif
 
 #define GTAO_PI          3.1415926535897932
 #define GTAO_PI_HALF     1.5707963267948966
@@ -193,8 +177,8 @@ float2 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SL
 
 	// Per-pixel noise for slice rotation and step jitter
 	float2 pixelPos = float2(pix);
-	float noiseSlice  = interleavedGradientNoise(pixelPos, 0.0);
-	float noiseSample = interleavedGradientNoise(pixelPos, 1.0); // different temporal offset for step jitter
+	float noiseSlice  = interleavedGradientNoise(pixelPos, floor(gModelTime * 60.0));
+	float noiseSample = interleavedGradientNoise(pixelPos, floor(gModelTime * 60.0));
 
 	// Accumulate visibility across all slices
 	float visibility = 0;
@@ -418,7 +402,7 @@ float4 PS_BLUR(const VS_OUTPUT i, uniform int GAUSS_KERNEL): SV_TARGET0 {
 	//   1.2 = slightly punchier, good if cockpit panel lines feel too subtle
 	//   1.5 = XeGTAO reference default, noticeably darker than stock
 	//   2.0+ = aggressive, likely to produce overpowered shadows on thin features
-	return float4(pow(ao, 1.0), 0, 0, 1);
+	return float4(pow(ao, 0.8), 0, 0, 1);
 }
 
 //=============================================================================

@@ -92,114 +92,6 @@ float3 applyDitheringOnLowLuminance(uint2 pixel, float3 color, float lumMaxInv)
 	return color * lerp((0.9 + 0.2 * dither_ordered8x8(pixel)), 1, saturate(lum * lumMaxInv));
 }
 
-//=============================================================================
-// Overcast Exposure Bias
-//=============================================================================
-//
-// On overcast days, auto-exposure (0.18 / avgLuminance) brightens the scene
-// to match sunny conditions, eliminating the subdued mood of diffuse
-// cloud-filtered lighting. We counteract this with a small negative exposure
-// bias when two conditions are simultaneously met:
-//
-//   1. The sun is reasonably high (gSunDir.y > ~10°). If the sun is near the
-//      horizon, low luminance is natural twilight/golden hour — don't touch it.
-//
-//   2. The ambient environment lighting is uniform (low directional contrast).
-//      Clear skies produce strong directional contrast in the ambient cube:
-//      bright zenith, dim opposite horizon. Overcast skies produce nearly
-//      uniform illumination from all directions. The ratio of the brightest
-//      to dimmest ambient cube channel is a direct, time-of-day-independent
-//      proxy for cloud cover.
-//
-// This is physically equivalent to a camera operator dialing in -EV on an
-// overcast day — standard practice in both cinematography and photography.
-//
-// The bias is applied as a multiplier on the linear exposure value, before
-// the HDR color is fed into the tonemap curve. This means the entire pipeline
-// (filmic curve, hybrid highlight blend, shadow recovery) operates on a
-// correctly-dimmed input. Nothing downstream needs to compensate.
-//
-// Tuning reference (real-world outdoor illuminance):
-//   Clear noon sun:     ~100,000 lux   (EV 15)
-//   Overcast noon:      ~10,000–20,000 lux   (EV 12–13)
-//   Heavy overcast:     ~1,000–5,000 lux   (EV 10–12)
-//
-// The difference between clear and overcast noon is roughly 2–3 EV stops.
-// Auto-exposure compensates for all of it. We let ~0.5 stops through as a
-// perceptual cue that the weather is different.
-//
-// Constants:
-//   overcastBiasMax      — maximum exposure reduction. 0.3 ≈ 0.5 stops.
-//                          At 0.3, a pixel that would render at 0.50 under
-//                          auto-exposure instead renders at 0.35. Visible
-//                          mood shift without looking "wrong."
-//   overcastContrastLow  — ambient cube contrast ratio below which we
-//                          consider the sky fully overcast. 1.3 means the
-//                          brightest ambient channel is only 30% brighter
-//                          than the dimmest — very uniform.
-//   overcastContrastHigh — ratio above which we consider the sky fully clear.
-//                          3.0 means 3:1 directional contrast — strong
-//                          directional lighting from clear sky + sun.
-//   sunGateLow           — sun elevation (sin) below which the bias is
-//                          fully disabled. sin(6°) ≈ 0.10. Below 6° is
-//                          golden hour / twilight.
-//   sunGateHigh          — sun elevation above which the bias is fully
-//                          enabled. sin(20°) ≈ 0.34. Above 20° the sun is
-//                          clearly "daytime" — low luminance must be from
-//                          cloud cover, not sun angle.
-//=============================================================================
-
-static const float overcastBiasMax      = 0.30;
-static const float overcastContrastLow  = 1.3;
-static const float overcastContrastHigh = 3.0;
-static const float sunGateLow           = 0.10;  // sin(~6°)
-static const float sunGateHigh          = 0.34;  // sin(~20°)
-
-float computeOvercastExposureBias()
-{
-	// --- Signal 1: Sun elevation ---
-	// gSunDir is a normalized world-space direction toward the sun.
-	// gSunDir.y is the vertical component: 0 at horizon, 1 at zenith.
-	float sunElevation = saturate(gSunDir.y);
-	float sunGate = smoothstep(sunGateLow, sunGateHigh, sunElevation);
-
-	// --- Signal 2: Ambient cube directional contrast ---
-	// AmbientAverageHorizon: average of the four horizon faces of the
-	// environment cube. AmbientTop: the zenith face. Together they
-	// represent the sky's illumination distribution.
-	//
-	// We compute a simple luminance for a weighted blend (horizon-biased
-	// because that's where the contrast between clear and overcast is
-	// most visible — clear skies have bright horizon scatter, overcast
-	// skies are uniform).
-	float3 ambientBlend = AmbientAverageHorizon * 0.7 + AmbientTop * 0.3;
-
-	// Per-channel max/min gives us the RGB contrast of the sky light.
-	// On a clear day, the sky is blue-heavy in one direction and warm in
-	// another — high R/G/B spread. On overcast, it's neutral gray —
-	// R ≈ G ≈ B, low spread.
-	float ambientMax = max(ambientBlend.r, max(ambientBlend.g, ambientBlend.b));
-	float ambientMin = min(ambientBlend.r, min(ambientBlend.g, ambientBlend.b));
-
-	// Contrast ratio. Protect against division by zero (fully dark scene).
-	// A ratio of 1.0 = perfectly achromatic/uniform. Higher = more directional.
-	float ambientContrast = (ambientMin > 0.001) ? (ambientMax / ambientMin) : 1.0;
-
-	// Map contrast to overcast amount:
-	//   Below overcastContrastLow (1.3): fully overcast (overcastAmount = 1)
-	//   Above overcastContrastHigh (3.0): fully clear (overcastAmount = 0)
-	float overcastAmount = 1.0 - smoothstep(overcastContrastLow, overcastContrastHigh, ambientContrast);
-
-	// Combine: only apply bias when BOTH the sun is high AND the sky is uniform.
-	// This prevents darkening at sunset (sun low → sunGate = 0) and prevents
-	// darkening on clear days (high contrast → overcastAmount = 0).
-	float bias = overcastBiasMax * overcastAmount * sunGate;
-
-	// Return as a multiplier: 1.0 = no change, 0.7 = maximum overcast dimming
-	return 1.0 - bias;
-}
-
-
 float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int tonemapOperator, uniform int flags = 0)
 {
 	uint2 uv = i.pos.xy;
@@ -233,11 +125,37 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 	float3 bloom = bloomTexture.SampleLevel(gBilinearClampSampler, i.projPos.zw, 0).rgb;
 	float exposure = getLinearExposure(lum);
 
-	// --- GEP: Overcast exposure bias ---
-	// Reduces exposure by up to ~0.5 stops on overcast days when the sun
-	// is high but the ambient cube indicates uniform sky illumination.
-	// See computeOvercastExposureBias() for full documentation.
-	exposure *= computeOvercastExposureBias();
+	// --- GEP: Sub-linear perceptual exposure compensation ---
+	// The stock exposure (0.18 / avgLum) perfectly normalizes every scene
+	// to the same display brightness. Human vision does not do this — bright
+	// scenes appear brighter than dim ones even after adaptation.
+	//
+	// This applies a mild power-law correction so that high-luminance scenes
+	// (sunny day) receive slightly more exposure and low-luminance scenes
+	// (night, heavy weather) receive slightly less.
+	//
+	// The correction is applied HERE (not inside getLinearExposure) so that
+	// the bloom threshold path in bloom.fx is unaffected — bloom still sees
+	// the original exposure, preventing unwanted bloom increase on sunny days.
+	//
+	// Tuning: gepExposureExponent controls the strength.
+	//   1.0  = no effect (stock behavior)
+	//   0.90 = mild (~15% brighter at high lum, ~15% darker at low lum)
+	//   0.85 = moderate
+	//   0.80 = strong (probably too much — test carefully)
+	//
+	// The neutral point where this has zero effect is when avgLum ≈ 0.18
+	// (the middle-gray key value). Above that, scenes get brighter; below, darker.
+	{
+		static const float gepExposureExponent = 0.80; // TUNE THIS
+		// Ratio: how far is the scene luminance from middle gray?
+		// At lum=0.18, ratio=1.0 and correction=1.0 (no change).
+		// At lum=2.0 (bright sun), ratio≈11, correction≈1.27 (+0.35 EV).
+		// At lum=0.01 (night), ratio≈0.056, correction≈0.75 (-0.4 EV).
+		float ratio = lum / 0.18;
+		float correction = pow(max(ratio, 0.001), 1.0 - gepExposureExponent);
+		exposure *= correction;
+	}
 
 	if(hwFactor>0)//TODO remove
 	{
@@ -282,7 +200,7 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 	}
 
 	//fixes banding effects in atmosphere, clouds, fog, volumetric lights at low luminance
-	screenColor = applyDitheringOnLowLuminance(i.pos.xy, screenColor, 1 / 0.285);
+	screenColor = ditherOutput8bit(screenColor, i.pos.xy);
 
 	if(flags & TONEMAP_FLAG_COLOR_GRADING)
 	{

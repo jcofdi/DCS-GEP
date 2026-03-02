@@ -6,8 +6,8 @@ shadingEditor = 0;
 
 options = 
 {
-	initItemsCount = 200;
-	maxSuperficialsPerFrame = 4;
+	initItemsCount = 400;
+	maxSuperficialsPerFrame = 8;
 	vehiclesDecimation = 1;
 	flatShadowsLayerInFinalColorPass = 13;
 }
@@ -31,11 +31,11 @@ end
 distances =
 {
 	commonFactor = 1;
-	-- JC Opus: Pushed higher to maintain detail at cruise altitudes
+	-- JC: Pushed higher to maintain detail at cruise altitudes
 	surfaceLevel0 = 45000.0;  -- was 30000; maintain highest detail to ~45km altitude
 	surfaceLevel1 = 60000.0;  -- was 40000; medium detail to ~60km altitude
 	
-	-- JC Opus: Extended LOD ring distances for sharp terrain silhouettes at altitude
+	-- JC: Extended LOD ring distances for sharp terrain silhouettes at altitude
 	surfaceLod =
 	{
 		{0, 0, 3000, 6000};                                             -- LOD 0: was 0-4km, now 0-6km
@@ -44,7 +44,7 @@ distances =
 		{28000, 28000, 80000, 200000};                                  -- LOD 3: was 16-150km, now 28-200km
  	};
 
-	-- JC Opus: Pushed from 20km to 30km to cover approach/departure visual range
+	-- JC: Pushed from 20km to 30km to cover approach/departure visual range
 	uniqueScene = 30000.0;  -- was 20000
 	details = {256, 512, 1024, 2048, 4096, 8192, 16384, 16384, 16384, 16384, 16384, 16384, 16384};
 	vehicles = 2000;
@@ -68,7 +68,7 @@ distances =
 		far = 2010.0;
 	};
 
---	asyncPreloadRadius = 80000.0;  -- JC Opus: noted but left commented; see first file notes
+--	asyncPreloadRadius = 80000.0;  -- JC: noted but left commented; see first file notes
 }
 lights = 
 {
@@ -124,7 +124,7 @@ weather =
 
 -- =============================================================================
 -- CLIPMAP CONFIGURATION
--- JC Opus: Quality = 2 (2048px textures, 4x area improvement over stock)
+-- JC: Quality = 2 (2048px textures, 4x area improvement over stock)
 -- =============================================================================
 clipmapQuality = 2  -- was 1; 2 = 2048px textures (4x area, 2x linear resolution)
 
@@ -139,8 +139,8 @@ clipmap =
 
 updatesClipmapPerFrame = 1
 clipmapsForcedRGBA = false
-clipmapTextureSize = 1024 * clipmapQuality  -- 2048 for JC Opus (Q=2)
-clipmapUpdateStep = 32 * clipmapQuality     -- 64 for JC Opus (Q=2)
+clipmapTextureSize = 1024 * clipmapQuality  -- 2048 for JC (Q=2)
+clipmapUpdateStep = 32 * clipmapQuality     -- 64 for JC (Q=2)
 clipmaptextures =	
 {
 	colortexture = 

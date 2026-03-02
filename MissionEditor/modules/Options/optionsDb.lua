@@ -255,8 +255,6 @@ graphics('visibRange')					:setValue('Low')	:combo({Name(_('LOW'))		:Value('Low'
 																	Name(_('HIGH'))		:Value('High'),
 																	Name(_('ULTRA'))	:Value('Ultra')		:OnlyArch64(),
 																	Name(_('EXTREME'))	:Value('Extreme')	:OnlyArch64(),
-																	Name(_('Ultimate'))	:Value('Ultimate')	:OnlyArch64(),
-																	Name(_('Insane'))	:Value('Insane')	:OnlyArch64(),
 																	Name(_('JC'))		:Value('JC')		:OnlyArch64(),
 																}):low('Low'):medium('Medium'):high('High'):VR('Medium')
 												
@@ -298,7 +296,6 @@ graphics('clouds'):setValue(1):combo({	Name(_('LOW_CLOUDS', 'LOW'))		   	:Value(
 										Name(_("STANDARD_CLOUDS","STANDARD"))	:Value(1),
 										Name(_('HIGH_CLOUDS', 'HIGH'))			:Value(2),
 										Name(_('ULTRA_CLOUDS', 'ULTRA'))		:Value(3),
-										Name(_('EXTREME_CLOUDS', 'Extreme'))	:Value(4),
                                }):low(0):medium(1):high(2)
 								
 graphics('anisotropy')					:setValue(4)		:combo({Name(_('OFF'))		:Value(0),

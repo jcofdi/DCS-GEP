@@ -137,7 +137,14 @@ float waterFresnel(float NoV) {
 #if 1
 	float g = sqrt(ior * ior + NoV * NoV - 1);
 	float fresnel = 0.5 * pow2(g - NoV) / pow2(g + NoV) * (1 + pow2(NoV * (g + NoV) - 1) / pow2(NoV * (g - NoV) + 1));
-	return saturate(fresnel); // [MOD] was saturate(fresnel * (NoV + 0.5))
+	
+// Dampen at extreme grazing angles to prevent reflection aliasing at horizon.
+// smoothstep ramps from 0.6 to 1.0 as NoV goes from 0 to 0.15 (~8.5°).
+// Below ~8.5° from horizon the reflection is capped at 60% — still much more
+// physically accurate than stock's 50% hard cap, but prevents streak artifacts
+// from bump map aliasing at distance.
+	float horizonDampen = smoothstep(0.0, 0.15, NoV) * 0.4 + 0.6;
+	return saturate(fresnel * horizonDampen);	// [MOD] was saturate(fresnel * (NoV + 0.5))
 #else
 	const float r = (ior - 1.0) / (ior + 1.0);
 	return saturate(r + (1.0 - r) * pow(1.0 - NoV, 5));

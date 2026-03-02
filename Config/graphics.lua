@@ -300,8 +300,8 @@ Camera =
 		districtobjects = {300, 300};
 		districts = {12000, 25000};
 
-		lodMult = 1.5;
-		lodAdd = 100;
+		lodMult = 1.0;
+		lodAdd = 0;
 	};
 }
 
@@ -431,15 +431,15 @@ CameraMirrors =
 		districts = {12000, 18000};
 		effects = {10000, 10000};
 
-		lodMult = 1.2;
-		lodAdd = 50;
+		lodMult = 1.5;
+		lodAdd = 0;
 	};
 }
 
 Terrain = 
 {	
-    LevelFormap0 = 35000;  -- JC Opus: was 25000; maintain detail at cruise altitude
-    LevelFormap1 = 70000;  -- JC Opus: was 50000; medium detail to higher altitude
+    LevelFormap0 = 35000;  -- JC Opus: was 25000; maintain detail at cruise altitude 35000
+    LevelFormap1 = 70000;  -- JC Opus: was 50000; medium detail to higher altitude 70000
     LevelFormap2 = 120000;
 	
 	distancFactor = {
@@ -448,7 +448,7 @@ Terrain =
 		High = 1.0;
 		Ultra = 1.2;
 		Extreme = 1.5;
-		JC = 2.0;  -- JC Opus: maximum terrain streaming multiplier for 80km vis
+		JC = 1.5;  -- JC Opus: maximum terrain streaming multiplier for 80km vis
 	};
 	
 	civTraffic = {		

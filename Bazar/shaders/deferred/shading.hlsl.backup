@@ -79,19 +79,9 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 	{
 		envLightSpecular = SampleEnvironmentMap(eis, R, roughness, roughnessMip, selectEnvCube, lerpEnvCubeFactor);
 		if (useSSLR) {
-		// Remove original floor of Mip1 and use constant mutliplier to adjust for rough and smooth surfaces as needed.
-		// Original calc was roughly times 0.5 so begin with that baseline.
-		float sslrMip = roughnessMip * 0.5;
-		float4 sslr = SSLRMap.SampleLevel(ClampLinearSampler, uvSSLR, sslrMip);
-
-		// Fade reflections near screen edges to prevent hard cutoff when
-		// reflected geometry exits the viewport. The 8% border width
-		// produces a smooth fallback to the environment cubemap.
-		float2 edgeFade = smoothstep(0.0, 0.08, uvSSLR) * smoothstep(0.0, 0.08, 1.0 - uvSSLR);
-		sslr.a *= edgeFade.x * edgeFade.y;
-
-		envLightSpecular = lerp(envLightSpecular, sslr.rgb, sslr.a);
-	}
+			float4 sslr = SSLRMap.SampleLevel(ClampLinearSampler, uvSSLR, max(1, roughnessMip / 2));
+			envLightSpecular = lerp(envLightSpecular, sslr.rgb, sslr.a);
+		}
 	}
 
 #if	USE_BRDF_K
@@ -99,10 +89,6 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 #else
 	float3 specColor = EnvBRDFApprox(specularColor, roughness, NoV);
 #endif
-	// Multiscatter energy compensation recovers energy lost by
-	// single-scattering GGX on rough metallic surfaces.
-	specColor *= SpecularEnergyCompensation(specularColor, roughness, NoV);
-
 	finalColor += envLightSpecular * specColor * (AO * energyLobe.y);
 
 	return finalColor;

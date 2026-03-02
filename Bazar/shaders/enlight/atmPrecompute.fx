@@ -133,8 +133,7 @@ float3 WriteMiePhaseFunctionPS(float4 vPos: SV_POSITION0): SV_TARGET0
 	float mieScale = 0.35;
 	return float3(miePhaseFunctionInput[id], miePhaseFunctionInput[id+1], miePhaseFunctionInput[id+2]) * mieScale;//пакуем в таргет R10G11B10
 }
-
-float3 ComputeTransmittancePS(float4 vPos: SV_POSITION0): SV_TARGET0
+float3 ComputeTransmittancePS(float4 vPos: SV_POSITION0): SV_TARGET0
 {
 	AtmosphereParameters atmParams; initAtmosphereParametersARPC(atmParams);
 	return ComputeTransmittanceToTopAtmosphereBoundaryTexture(atmParams, vPos.xy);

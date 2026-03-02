@@ -3,6 +3,7 @@
 
 #include "common/AmbientCube.hlsl"
 #include "deferred/deferredCommon.hlsl"
+#include "common/context.hlsl"
 #include "common/dithering.hlsl"
 
 #define FOG_ENABLE
@@ -183,7 +184,7 @@ float3 atmApplyLinearDithered(float3 v, float distance, float3 color, float2 pix
 	// fading to zero below HDR luminance 0.01 where dither dominates signal.
 	float _ditherLum = dot(result, float3(0.2126, 0.7152, 0.0722));
 	float _ditherAmp = 0.001 * saturate(_ditherLum * 100.0);
-	result = ditherAtmosphericHDR(result, pixelPos, _ditherAmp);
+	result = ditherAtmosphericHDR(result, pixelPos, _ditherAmp, gModelTime);
 	// ========== END ATMOSPHERIC DITHERING ==========
 	
 	return result;

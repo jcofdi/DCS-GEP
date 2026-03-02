@@ -5,7 +5,6 @@
 #include "common/fog2.hlsl"
 #include "common/samplers11.hlsl"
 #include "enlight/materialParams.hlsl"
-#include "common/dithering.hlsl"
 
 #define USE_ROTATE_PCF 1
 #define BASE_SHADOWMAP_SIZE 4096
@@ -67,8 +66,8 @@ float2 SampleShadowClouds(float3 pos)
 		float3 uvw = pos * gCloudVolumeScale + gCloudVolumeOffset;
 		float2 s = cloudsShadowTex3D.SampleLevel(gBilinearClampSampler, uvw.xzy, 0).yx;
 		if(uvw.y>1) s = 1;
-//		s.x *= s.x;   // squared shadow power. Replace with adjustable power control
-		s.x = pow(s.x, 1.5);
+		s.x *= s.x;
+		s.x = s.x < 0.10 ? 0.0 : s.x;  // floor clamp: kill residual tail under thick cloud
 		s.x = min(s.x, getFogTransparency(ProjectOriginSpaceToSphere(pos).y + gOrigin.y, gSunDir.y, 400000.0f));
 		return s;
 	}
@@ -93,67 +92,21 @@ float SampleShadowCascade(float3 wPos, float depth, float3 normal, uniform bool 
 	if (useOnlyFirstMap) {
 		return SampleShadowMap(wPos, NoL, ShadowFirstMap, usePCF, samplesMax, false);
 	} else {
-		// Derive stable screen-space pixel coordinates from wPos via the
-		// view-projection matrix already available in this scope. This
-		// avoids threading SV_POSITION through the entire call chain.
-		float4 _clipPos = mul(float4(wPos, 1.0), gViewProj);
-		float2 _ndc = _clipPos.xy / _clipPos.w;
-		float2 _pixelPos = (float2(_ndc.x, -_ndc.y) * 0.5 + 0.5) * 2048.0;
-		float _noise = interleavedGradientNoise(_pixelPos);
-
-		// Transition half-width in depth units per cascade boundary.
-		// 2.5% of cascade depth — wide enough to dissolve the seam,
-		// narrow enough to avoid visibly blurring shadow detail.
-		#define CASCADE_TRANS_FRAC 0.025
-
-		// Cascade 0 (farthest) — beyond all shadow maps
 		if (depth > ShadowDistance[0])
 			return SampleShadowMap(wPos, NoL, 0, usePCF, samplesMax, useTreeShadow);
 
-		// Cascade 0→1 transition
-		if (depth > ShadowDistance[1]) {
-			float tw = ShadowDistance[1] * CASCADE_TRANS_FRAC;
-			float edge = ShadowDistance[1] + tw;
-			if (depth < edge) {
-				float t = (edge - depth) / tw;
-				return SampleShadowMap(wPos, NoL, (_noise < t) ? 1 : 0, usePCF, samplesMax, useTreeShadow);
-			}
+		if (depth > ShadowDistance[1])
 			return SampleShadowMap(wPos, NoL, 1, usePCF, samplesMax, useTreeShadow);
-		}
 
-		// Cascade 1→2 transition
-		if (depth > ShadowDistance[2]) {
-			float tw = ShadowDistance[2] * CASCADE_TRANS_FRAC;
-			float edge = ShadowDistance[2] + tw;
-			if (depth < edge) {
-				float t = (edge - depth) / tw;
-				uint idx = (_noise < t) ? 2 : 1;
-				return SampleShadowMap(wPos, NoL, idx, usePCF, samplesMax, useTreeShadow, idx == 2 ? 2.5 : 3.0);
-			}
+		if (depth > ShadowDistance[2])
 			return SampleShadowMap(wPos, NoL, 2, usePCF, samplesMax, useTreeShadow, 2.5);
-		}
 
-		// Cascade 2→3 transition (outermost, includes stock fade-to-1)
 		if (depth > ShadowDistance[3]) {
-			float tw = ShadowDistance[3] * CASCADE_TRANS_FRAC;
-			float edge = ShadowDistance[3] + tw;
-
-			// Stock outermost fade behavior preserved exactly
-			float shadow3;
 			if (useTreeShadow)
-				shadow3 = max(SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, true, 2), smoothstep(ShadowDistance[2], ShadowDistance[3], depth));
+				return max(SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, true, 2), smoothstep(ShadowDistance[2], ShadowDistance[3], depth));
 			else
-				shadow3 = max(SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, false, 2), smoothstep(ShadowCascadeFadeDepth, ShadowDistance[3], depth));
-
-			if (depth < edge) {
-				float t = (edge - depth) / tw;
-				if (_noise < t)
-					return SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, useTreeShadow, 2);
-			}
-			return shadow3;
+				return max(SampleShadowMap(wPos, NoL, 3, usePCF, samplesMax, false, 2), smoothstep(ShadowCascadeFadeDepth, ShadowDistance[3], depth));
 		}
-
-		#undef CASCADE_TRANS_FRAC
 		return 1;
 	}
 }	

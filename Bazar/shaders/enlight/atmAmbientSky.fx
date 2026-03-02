@@ -488,7 +488,18 @@ void ComputeAerialTransmittance(uint id: SV_GroupIndex, uint3 gId: SV_GroupID, u
 	float distKm = i.dist * 0.001;
 	float _t = saturate((distKm - 3.0) / 80.0);
 	float cloudAerialFactor = lerp(0.35, 0.92, sqrt(_t));
-	tex3DOutput[dId.xyz]  = float4(inscatterColor * gAtmIntensity * cloudAerialFactor, 0);
+
+	// Suppress Mie forward-scatter spike in cloud aerial perspective.
+	// Rayleigh inscatter is diffuse and low-intensity. Mie adds a huge
+	// directional peak toward the sun. Clamping luminance to a modest
+	// ceiling preserves atmospheric tint while killing the directional
+	// sun glow that shouldn't penetrate thick cloud.
+	float inscatterLum = dot(inscatterColor, float3(0.2126, 0.7152, 0.0722));
+	float maxInscatter = 0.15;  // tune: higher = more haze, lower = less sun bleed
+	float clampFactor = inscatterLum > maxInscatter ? maxInscatter / inscatterLum : 1.0;
+	float3 clampedInscatter = inscatterColor * clampFactor;
+
+	tex3DOutput[dId.xyz]  = float4(clampedInscatter * gAtmIntensity * cloudAerialFactor, 0);
 	tex3DOutput2[dId.xyz] = float4(lerp(1.0, transmittance, cloudAerialFactor), 0);
 }
 

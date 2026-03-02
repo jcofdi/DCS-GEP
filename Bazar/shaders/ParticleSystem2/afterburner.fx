@@ -470,9 +470,8 @@ float4 psAfterburner(in GS_OUTPUT i, uniform bool bHotAir): SV_TARGET0
 		// This smooths the hard visible contour where the plume fades into
 		// the background, replacing the abrupt ring with noise-scattered
 		// single-bit variations that are imperceptible in motion.
-		float ign = interleavedGradientNoise(i.pos.xy);
-		linearAlpha += (ign - 0.5) * (1.0 / 128.0);
-
+		linearAlpha += ditherCentered(uint2(i.pos.xy)) * (1.0 / 128.0);
+		
 		return float4(linearColor * linearAlpha, linearAlpha) * i.cldAlpha * volumeBrightness;
 	}
 #endif
@@ -518,8 +517,7 @@ float4 psCircle(in GS_OUTPUT i, uniform bool bHotAir): SV_TARGET0
 		// The BlackBorderLinearSampler produces a hard 0→texture transition
 		// at the circle quad edges. Dithering the alpha at that boundary
 		// breaks up the visible rectangular clip of each shock diamond.
-		float ign = interleavedGradientNoise(i.pos.xy);
-		clr.a += (ign - 0.5) * (2.0 / 255.0);
+		clr.a += ditherCentered(uint2(i.pos.xy)) * (2.0 / 255.0);
 
 		return clr * i.UV.z * 0.72*circleBrightness;
 	}

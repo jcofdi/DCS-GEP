@@ -38,8 +38,8 @@ Texture2D tex;
 // ---------------------------------------------------------------------------
 static const float CABLE_ROUGHNESS  = 0.5;
 static const float CABLE_METALNESS  = 0.7;
-static const float CABLE_AO         = 0.9;
-static const float CABLE_BRIGHTNESS = .42;
+static const float CABLE_AO         = 0.92;
+static const float CABLE_BRIGHTNESS = .43;
 
 struct VS_OUTPUT {
 	float3 pos	: TEXTURE0;
