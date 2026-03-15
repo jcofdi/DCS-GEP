@@ -399,7 +399,7 @@ void ComputeSkyAmbient(uint id: SV_GroupIndex, uint3 gId: SV_GroupID, uint3 tId:
 	//
 	// [ORIGINAL] texOutput[dId.xy] = sqrt((sample.sum / sample.weight));
 	// texOutput[dId.xy] = SampleSkyWithCylinderProjection(float2(uDistance, uAltitude), bSampleTopHemisphereOnly, surfaceAlbedo*cloudsTransparency) * 4;
-	texOutput[dId.xy] = max(1e-6, sample.sum / max(sample.weight, 0.001));
+	texOutput[dId.xy] = max(1e-6, sample.sum / max(sample.weight, 0.001)) * 1.25; // Indirect light boost to balance cloud brightness directionality.
 }
 
 float3 GetTotalSunRadiance(float altitude, float muS)
@@ -419,7 +419,9 @@ void ComputeSunColor(uint id: SV_GroupIndex, uint3 gId: SV_GroupID, uint3 tId: S
 
 	TexelParameters i = getParametersFromTexel(dId.xy, texSize.xy, altitudeMax, distanceRange);
 
-	texOutput[dId.xy] = float4(GetTotalSunRadiance(i.altitude, i.muS), 0);
+	float3 sunRad = GetTotalSunRadiance(i.altitude, i.muS);
+    sunRad *= 0.80;  // reduce sun contribution to clouds
+    texOutput[dId.xy] = float4(sunRad, 0);
 }
 
 struct AerialParameters

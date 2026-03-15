@@ -48,6 +48,38 @@ float3 applyDitheringOnLowLuminance(uint2 pixel, float3 color, float lumMaxInv)
 	return color * lerp((0.9 + 0.2*dither_ordered8x8(pixel)), 1, saturate(lum*lumMaxInv));
 }
 
+#define AIRGLOW_INTENSITY 1e-5
+
+// Normalized so max component is 1.0; brightness controlled by AIRGLOW_INTENSITY.
+static const float3 AIRGLOW_COLOR = float3(0.60, 0.75, 1.00);
+
+float3 computeNightSkyFloor(float3 viewDir, float3 computedSkyColor)
+{
+    // Only contribute when the Bruneton model returns near-zero radiance.
+    // This naturally handles all cases:
+    //   Daytime/twilight: computedSkyColor is large, weight is 0.
+    //   Moonlit night: computedSkyColor is small but nonzero, weight is 0 or small.
+    //   Moonless night: computedSkyColor is approximately 0, weight is 1.
+    float skyLum = dot(computedSkyColor, float3(0.2126, 0.7152, 0.0722));
+
+    // Onset threshold: when computed sky luminance falls below this value,
+    // the airglow floor begins to contribute. At 10x this value, the floor
+    // contribution is zero. The transition is smooth (saturate of linear ramp).
+    // Set low enough that moonlit sky (even thin crescent) suppresses the floor.
+    float onsetThreshold = AIRGLOW_INTENSITY * 5.0;
+    float floorWeight = saturate(1.0 - skyLum / max(onsetThreshold, 1e-12));
+
+    float cosZenith = saturate(viewDir.y);
+    float airmass = 1.0 / max(cosZenith, 0.05);  // clamp at approximately 87 degrees
+    float extinction = exp(-0.3 * (airmass - 1.0));  // normalized: 1.0 at zenith
+
+    // Below the horizon (viewDir.y < 0), suppress entirely.
+    // Objects below horizon are terrain, not sky.
+    float horizonMask = smoothstep(-0.02, 0.05, viewDir.y);
+
+    return AIRGLOW_COLOR * AIRGLOW_INTENSITY * extinction * horizonMask * floorWeight;
+}
+
 float4 PS(VS_OUTPUT i, uniform bool drawSunDisk): SV_TARGET0
 {
 	float3 viewDir = normalize(i.ray);
@@ -59,17 +91,14 @@ float4 PS(VS_OUTPUT i, uniform bool drawSunDisk): SV_TARGET0
 
 	float3 skyColor = skyRadiance * gAtmIntensity;
 
-	// ========== PRE-TONEMAP SKY DITHERING ==========
-	// Apply IGN-based dithering in linear HDR space to break LUT quantization bands
-	// in the sky dome. This is the primary anti-banding measure — the tonemapper's
-	// Bayer dithering only operates post-gamma in a narrow luminance range and cannot
-	// fully compensate for banding that originates in the scattering LUT lookups.
+
 	// Luminance-adaptive amplitude: matches atmosphere.hlsl fix.
 	float _ditherLum = dot(skyColor, float3(0.2126, 0.7152, 0.0722));
 	float _ditherAmp = 0.001 * saturate(_ditherLum * 100.0);
 	skyColor = ditherAtmosphericHDR(skyColor, i.pos.xy, _ditherAmp, gModelTime);
-	// ========== END SKY DITHERING ==========
 
+	skyColor += computeNightSkyFloor(viewDir, skyColor);
+	
 	if(drawSunDisk)
 		skyColor += transmittance * SunDisc(viewDir, atmSunDirection);
 		
@@ -99,15 +128,15 @@ float4 PS2(VS_OUTPUT i, uniform bool bFadeByHeight): SV_TARGET0
 		
 		float nHeight = saturate((gCameraPos.y + gOrigin.y) / 15000.0);
 		skyColor = lerp(skyRadiance, skyRadianceBase, nHeight) * gAtmIntensity;
+		skyColor += computeNightSkyFloor(viewDir, skyColor);
 	}
 	else
 	{
 		skyColor = GetSkyRadiance(r, mu2, atmEarthCenter, viewDir, 0.0, atmSunDirection, transmittance, singleMieScattering, atmDepth) * gAtmIntensity;
 	}
 
-	// ========== PRE-TONEMAP SKY DITHERING ==========
 	skyColor = ditherAtmosphericHDR(skyColor, i.pos.xy, 0.004);
-	// ========== END SKY DITHERING ==========
+	skyColor += computeNightSkyFloor(viewDir, skyColor);
 
 	if (gIceHaloParams.atmosphereFactor > 0.0)
 		skyColor += sampleHalo(gBilinearClampSampler, viewDir, gSunDir) * singleMieScattering * (gAtmIntensity * gIceHaloParams.atmosphereFactor);

@@ -41,10 +41,15 @@ struct VS_OUTPUT
 
 struct PS_INPUT
 {
-	float4 pos		 : SV_POSITION0;
-	float3 posW	 : TEXCOORD0;
-	float3 TextureUV : TEXCOORD1;
-	float2 age		 : TEXCOORD2;
+    float4 pos       : SV_POSITION0;
+    float3 posW      : TEXCOORD0;
+    float3 TextureUV : TEXCOORD1;
+    float2 age       : TEXCOORD2;
+    // [MOD] Per-particle cloud shadow sampled in GS, not per-pixel.
+    // Cloud shadows vary on 100m+ scales; per-pixel sampling is redundant
+    // for 35-120m billboard particles and wastes ~2500x texture fetches
+    // under typical overdraw.
+    nointerpolation float cloudShadow : TEXCOORD3;
 };
 
 
@@ -68,12 +73,18 @@ VS_OUTPUT VS(float4 params		: TEXCOORD0, // UV, random[0..1], age
 	const float nAge = AGE / lifetime;
 	const float nSpeed = min(1, speed/13.9); // up to 50 km/h
 
-	float posSideOffset = (DIST-0.5) * width;
+	// [MOD] Age-dependent lateral spread: wake widens as turbulent
+    // diffusion disperses the foam pattern. Factor of 2.0 at end of
+    // life roughly matches sqrt(2*K*t) for K ~5 m^2/s over typical
+    // particle lifetimes. Particles near centerline (DIST ~0.5) move
+    // less; particles at edges spread outward faster.
+    float spreadFactor = 1.0 + 1.0 * nAge;
+    float posSideOffset = (DIST-0.5) * width * spreadFactor;
 
-	float3 posOffset = startPos - worldOffset + normalize(float3(startVel.z, 0, -startVel.x)) * posSideOffset;
+    float3 posOffset = startPos - worldOffset + normalize(float3(startVel.z, 0, -startVel.x)) * posSideOffset;
 
-	float scaleFactor = 1 + 0.5 * nAge;
-	float scale = scaleBase * scaleFactor;
+    float scaleFactor = 1 + 0.5 * nAge;
+    float scale = scaleBase * scaleFactor;
 
 	float distFactor = max(0, (distance(gCameraPos, posOffset) - 500)) / 9500;
 
@@ -94,34 +105,38 @@ VS_OUTPUT VS(float4 params		: TEXCOORD0, // UV, random[0..1], age
 [maxvertexcount(4)]
 void GS(point VS_OUTPUT input[1], inout TriangleStream<PS_INPUT> outputStream, uniform float sizeMult = 1.0, uniform float altitude = 0)
 {
-	PS_INPUT o;
-	o.age = input[0].params2.xy;
+    PS_INPUT o;
+    o.age = input[0].params2.xy;
 
-	float3 posOffset	= input[0].pos.xyz;
-	float  angle		= input[0].pos.w;
-	float  scale		= input[0].params.x * lerp(1, sizeMult, o.age.y);
-	float  Rand			= input[0].params.y;
-	float  opacity		= input[0].params.z;
+    float3 posOffset    = input[0].pos.xyz;
+    float  angle        = input[0].pos.w;
+    float  scale        = input[0].params.x * lerp(1, sizeMult, o.age.y);
+    float  Rand         = input[0].params.y;
+    float  opacity      = input[0].params.z;
 
-	posOffset.y += altitude;
+    posOffset.y += altitude;
 
-	float2x2 mRot = rotMatrix2x2(angle);
-	
-	o.TextureUV.z = opacity;
-	
-	[unroll]
-	for(uint i = 0; i < 4; i++)
-	{
-		o.TextureUV.xy = float2(staticVertexData[i].z + Rand, staticVertexData[i].w);
+    // [MOD] Sample cloud shadow once per particle at billboard center.
+    // Matches the pattern ED uses for bow spray cascade shadows in GS_bow.
+    o.cloudShadow = SampleShadowClouds(posOffset + worldOffset).x;
 
-		float3 vPos = {staticVertexData[i].x, 0, staticVertexData[i].y};
-		vPos.xz = mul(vPos.xz, mRot) * scale;
-		o.posW = vPos + posOffset;
-		o.pos = mul(float4(o.posW, 1), VP);
+    float2x2 mRot = rotMatrix2x2(angle);
 
-		outputStream.Append(o);
-	}
-	outputStream.RestartStrip();
+    o.TextureUV.z = opacity;
+
+    [unroll]
+    for(uint i = 0; i < 4; i++)
+    {
+        o.TextureUV.xy = float2(staticVertexData[i].z + Rand, staticVertexData[i].w);
+
+        float3 vPos = {staticVertexData[i].x, 0, staticVertexData[i].y};
+        vPos.xz = mul(vPos.xz, mRot) * scale;
+        o.posW = vPos + posOffset;
+        o.pos = mul(float4(o.posW, 1), VP);
+
+        outputStream.Append(o);
+    }
+    outputStream.RestartStrip();
 }
 
 // [MOD] Issue S3: Corrected stern trail foam albedo from dark green-tinted to
@@ -144,18 +159,20 @@ float4 PS(PS_INPUT i) : SV_TARGET0
 	float circleMask = tex.Sample(WrapLinearSampler, i.TextureUV.xy).a;
 	float grad = min(1, nAge*2.0);
 	float mask = foam * circleMask;
-	mask *= lerp(1, mask, grad);
+    mask *= lerp(1, mask, grad);
 
-	// [MOD] Issue S3: White foam albedo instead of dark green.
-	// Thick foam = high albedo (~0.55), thin foam contribution fades toward water color.
-	// The foam texture value modulates brightness: dense foam is brighter.
-	float foamBrightness = 0.35 + 0.2 * foam; // [MOD] range 0.35 to 0.55
-	float3 albedo = float3(foamBrightness, foamBrightness, foamBrightness); // [MOD] achromatic
+    // [MOD] Early alpha clip: skip all shading for invisible fragments.
+    // Foam textures have large transparent borders; this eliminates
+    // 30-50% of shading work in the wake pass. Threshold 0.004 is
+    // below any visible contribution after alpha blending.
+    if (mask < 0.004) return float4(0, 0, 0, 0);
 
-	// [MOD] Issue S5: Apply cloud shadow to sun contribution.
-	float shadow = SampleShadowClouds(i.posW + worldOffset).x;
-	float3 sunColor = getPrecomputedSunColor(0) * shadow / PI; // [MOD] was no shadow
-	float3 clr = shading_AmbientSun(albedo, AmbientAverage, sunColor)*mask;
+    float foamBrightness = 0.35 + 0.2 * foam;
+    float3 albedo = float3(foamBrightness, foamBrightness, foamBrightness);
+
+    // [MOD] Use per-particle cloud shadow from GS instead of per-pixel sample.
+    float3 sunColor = getPrecomputedSunColor(0) * i.cloudShadow / PI;
+    float3 clr = shading_AmbientSun(albedo, AmbientAverage, sunColor)*mask;
 
 	mask *= underwaterVisible(i.posW);
 

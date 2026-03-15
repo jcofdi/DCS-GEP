@@ -170,15 +170,36 @@ float2 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SL
 	// Cap screen radius to avoid excessive cache thrashing without depth MIPs.
 	// At large radii, depth samples are far apart in memory. 128px ≈ reasonable
 	// for L1/L2 cache locality on most GPUs.
-	screenRadius = min(screenRadius, 128.0);
+	// V3: Distance-adaptive screen radius cap.
+	//
+	// At close range, neighboring pixels map to nearby world-space positions
+	// with similar depths, so the structured horizon march stays cache-coherent
+	// even at wider pixel radii. At far range, depth discontinuities cause
+	// cache line thrashing when samples span large pixel distances.
+	//
+	// XeGTAO reference recommends 256px as a default cap. We use 256 at close
+	// range (where it is cheap) and taper to 128 at distance (where the
+	// original conservative limit applies).
+	//
+	// Transition band 15-50m view-space distance:
+	//   < 15m : 256px (full close-range detail)
+	//   15-50m: smooth linear blend
+	//   > 50m : 128px (matches previous behavior)
+	float maxScreenRadius = lerp(256.0, 128.0, saturate((vPos.z - 15.0) / 35.0));
+	screenRadius = min(screenRadius, maxScreenRadius);
 
 	// Pixel-too-close threshold: don't sample the center pixel itself
 	float minStep = 1.3 / screenRadius;
 
-	// Per-pixel noise for slice rotation and step jitter
+	// Per-pixel noise for slice rotation and step jitter.
+	// CRITICAL: these must use different seeds. Identical seeds produce
+	// correlated slice angles and step offsets, creating structured banding
+	// that the bilateral blur cannot fully remove. Offset of 1.0 on the
+	// frame counter is sufficient since IGN is a spatial hash -- any
+	// distinct second argument produces a fully decorrelated pattern.
 	float2 pixelPos = float2(pix);
 	float noiseSlice  = interleavedGradientNoise(pixelPos, floor(gModelTime * 60.0));
-	float noiseSample = interleavedGradientNoise(pixelPos, floor(gModelTime * 60.0));
+	float noiseSample = interleavedGradientNoise(pixelPos, floor(gModelTime * 60.0) + 1.0);
 
 	// Accumulate visibility across all slices
 	float visibility = 0;
@@ -402,7 +423,7 @@ float4 PS_BLUR(const VS_OUTPUT i, uniform int GAUSS_KERNEL): SV_TARGET0 {
 	//   1.2 = slightly punchier, good if cockpit panel lines feel too subtle
 	//   1.5 = XeGTAO reference default, noticeably darker than stock
 	//   2.0+ = aggressive, likely to produce overpowered shadows on thin features
-	return float4(pow(ao, 0.8), 0, 0, 1);
+	return float4(pow(ao, 1.0), 0, 0, 1);
 }
 
 //=============================================================================

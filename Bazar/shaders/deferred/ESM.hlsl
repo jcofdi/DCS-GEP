@@ -83,7 +83,7 @@ float terrainShadows(float4 pos) {
 //   2048  → 0.00073
 // The value is intentionally slightly larger than 1-texel to dissolve
 // stair-steps without visibly softening contact shadows.
-#define SECONDARY_SSM_FILTER_RADIUS 0.00073
+#define SECONDARY_SSM_FILTER_RADIUS 0.00050
 
 float secondarySSM(float4 pos, uniform uint idx) {
 

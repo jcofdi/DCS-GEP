@@ -72,7 +72,14 @@ float4 getReflectionDistorsionColor(float2 uv, float3 normal, float distance) {
 	//   At   10m: sqrt(10)  * 0.0005 ≈ 0.0016  (similar to old constant ~0.001)
 	//   At  100m: sqrt(100) * 0.0005 ≈ 0.005   (was 0.051 — 10× smaller)
 	//   At 5000m: sqrt(5000)* 0.0005 ≈ 0.035   (was 2.50  — 70× smaller)
-	float f = sqrt(max(distance, 1.0)) * 0.0005;
+	// Cap maximum scatter radius to prevent ghost images at medium distance.
+	// 0.005 in UV space is roughly 10px on a 1920 buffer -- enough to soften
+	// the reflection edge without creating visible offset duplicates.
+	float f = min(sqrt(max(distance, 1.0)) * 0.0003, 0.005);
+	// Fade scatter to zero beyond 5km. At those ranges the reflection is
+	// pure sky/environment and the cross-pattern sampling creates visible
+	// hatching for no visual benefit.
+	f *= saturate(1.0 - (distance - 3000.0) / 2000.0);
 	float2 d = normalize(float2(normal.xz)) * r.w * f;
 
 	float4 rcolor = float4(r.xyz*r.w, r.w);

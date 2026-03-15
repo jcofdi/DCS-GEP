@@ -66,8 +66,9 @@ float2 SampleShadowClouds(float3 pos)
 		float3 uvw = pos * gCloudVolumeScale + gCloudVolumeOffset;
 		float2 s = cloudsShadowTex3D.SampleLevel(gBilinearClampSampler, uvw.xzy, 0).yx;
 		if(uvw.y>1) s = 1;
-		s.x *= s.x;
-		s.x = s.x < 0.10 ? 0.0 : s.x;  // floor clamp: kill residual tail under thick cloud
+		float shadowFloor = 0.30;
+		s.x = saturate((s.x - shadowFloor) / (1.0 - shadowFloor));
+		s.x = smoothstep(-0.1, 1.1, s.x); // soften transitions
 		s.x = min(s.x, getFogTransparency(ProjectOriginSpaceToSphere(pos).y + gOrigin.y, gSunDir.y, 400000.0f));
 		return s;
 	}

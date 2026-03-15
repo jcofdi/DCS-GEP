@@ -1,17 +1,47 @@
 #ifndef TONEMAP_HLSL
 #define TONEMAP_HLSL
 
+// =========================================================================
+// GEP toneMap.hlsl - Perceptual Tonemapping with Adaptive Hable Curve
+// =========================================================================
+// Combines two approaches:
+//
+// 1. ICtCp perceptual color space (ITU-T T.302): intensity and chrominance
+//    processed independently using the ST.2084 PQ transfer function.
+//    Matches GT7/Polyphony Digital's reference implementation.
+//    Resolves Oklab's hue twist under extreme illuminant conditions.
+//
+// 2. Hable piecewise filmic curve with adaptive parameters: slope, toe,
+//    and whiteClip vary with scene brightness (avgLum) to match
+//    perceptual contrast sensitivity across lighting conditions.
+//    Night: gentle slope, deep toe crush, bright highlights.
+//    Day: steep slope, open shadows, moderate highlights.
+//
+// Architecture:
+//   Stock auto-exposure normalizes content center to ~0.18.
+//   Sub-linear exponent (Tonemap.fx) provides perceptual brightness envelope.
+//   Adaptive curve parameters reshape contrast per-condition.
+//   ICtCp decomposition with GT7 chroma preservation handles color.
+//
+// Preserved interfaces (required by Tonemap.fx, bloom.fx, etc):
+//   - getAvgLuminanceClamped(), getLinearExposure(), getLinearExposureMFD()
+//   - toneMap() switch (LINEAR/EXPONENTIAL/FILMIC)
+//   - simpleToneMap(), simpleToneMapFLIR()
+//   - plotNumber(), plotQuad(), debugDraw()
+//   - LuminanceToHistogramPos()
+// =========================================================================
+
 #include "deferred/tonemapCommon.hlsl"
 #include "deferred/luminance.hlsl"
 #include "common/ambientCube.hlsl"
-#include "deferred/filmicCurve.hlsl"
 
-// ACES encoding https://www.shadertoy.com/view/Mdfcz7
+Buffer<float> histogram;
+Texture1D<float> tonemapLUT;
 
-#define OPERATOR_LUT 0
 
-Buffer<float>			histogram;
-Texture1D<float>		tonemapLUT;
+// =========================================================================
+// Luminance and exposure functions
+// =========================================================================
 
 float getAvgLuminanceClamped() {
 	return clamp(getAverageLuminance(), sceneLuminanceMin, sceneLuminanceMax);
@@ -21,19 +51,10 @@ float getAvgLuminanceClampedCockpit() {
 	return clamp(getAverageLuminanceCockpit(), sceneLuminanceMin, sceneLuminanceMax);
 }
 
-float getLinearExposure(float averageLuminance, float exposureCorrection = 0) 
+float getLinearExposure(float averageLuminance, float exposureCorrection = 0)
 {
-	if(0)//old-school
-	{
-		const float toneMapFactor = 0.0001;
-		return 0.18 / (pow(averageLuminance, dcExposureKey) + toneMapFactor);
-	}
-	else
-	{
-		float linearExposure = 0.18 / averageLuminance; 
-
-		return exp2(log2(linearExposure) + dcExposureCorrection);
-	}
+	float linearExposure = 0.18 / averageLuminance;
+	return exp2(log2(linearExposure) + dcExposureCorrection);
 }
 
 float getLinearExposureMFD(float averageLuminance) {
@@ -42,147 +63,174 @@ float getLinearExposureMFD(float averageLuminance) {
 	return 0.5 / (pow(averageLuminance, exposureKey) + toneMapFactor);
 }
 
-/*
-	//полосочками картинка
-    vec2 center = vec2(iResolution.x/2., iResolution.y/2.);
-    vec2 uv = fragCoord.xy;
-    
-    float scale = 1.;
-    float radius = .5;
-    vec2 d = uv - center;
-    float r = length(d)/1000.;
-    float a = atan(d.y,d.x) + scale*(radius-r)/radius;
-    //a += .1 * iGlobalTime;
-    vec2 uvt = center+r*vec2(cos(a),sin(a));
-    
-	vec2 uv2 = fragCoord.xy / iResolution.xy;
-    float c = ( .75 + .25 * sin( uvt.x * 1000. ) );
-    vec4 color = texture2D( iChannel0, uv2 );
-    float l = luma( color );
-    float f = smoothstep( .5 * c, c, l );
-	f = smoothstep( 0., .5, f );
-    
-	fragColor = vec4( vec3( f ),.0);
-*/
 
-float3 ToneMap_Hejl2015(float3 color, float whitePoint) {
-	float4 vh = float4(color, whitePoint);
-	float4 va = (1.425 * vh) + 0.05f;
-	float4 vf = ((vh * va + 0.004f) / (( vh * (va + 0.55f) + 0.0491f))) - 0.0821f;
-	return vf.rgb / vf.www;
-}
+// =========================================================================
+// GEP Adaptive Hable Curve Parameters
+// =========================================================================
+// Three conditions define the curve shape across lighting scenarios.
+// Intermediate values are smoothstep-interpolated by unclamped avgLum.
+//
+// Night (avgLum <= 0.010): scotopic vision, low contrast sensitivity,
+//   deep shadow crush, bright point sources pop against dark background.
+//
+// Evening (avgLum ~0.045): mesopic transition, moderate contrast,
+//   balanced shadow/highlight handling.
+//
+// Day (avgLum >= 0.200): photopic vision, high contrast sensitivity,
+//   open shadows, punchy midrange.
+//
+// Shoulder and blackClip are fixed across all conditions.
+// =========================================================================
 
-//http://filmicworlds.com/blog/filmic-tonemapping-with-piecewise-power-curves/
-#if 0 
-float3 ToneMap_Filmic_JohnHable(float3 hdrColor)
-{	
-	CurveParamsDirect params;
-	params.m_x0 = m_x0;
-	params.m_y0 = m_y0;
-	params.m_x1 = m_x1;
-	params.m_y1 = m_y1;
-	params.m_W = m_W;
-	params.m_overshootX = m_overshootX;
-	params.m_overshootY = m_overshootY;
-	params.m_gamma = m_gamma;
-	
-	FullCurve curve;
-	CreateCurve(curve, params);
+// --- Night ---
+static const float gepNightSlope     = 0.865;
+static const float gepNightToe       = 0.550;
+static const float gepNightWhiteClip = 0.125;
 
-	return float3(FullCurveEval(curve, hdrColor.r), FullCurveEval(curve, hdrColor.g), FullCurveEval(curve, hdrColor.b));
-}
-#endif
+// --- Evening ---
+static const float gepEveningSlope     = 0.900;
+static const float gepEveningToe       = 0.450;
+static const float gepEveningWhiteClip = 0.08;
+
+// --- Day ---
+static const float gepDaySlope     = 1.000;
+static const float gepDayToe       = 0.402;
+static const float gepDayWhiteClip = 0.050;
+
+// --- Fixed across all conditions ---
+static const float gepShoulder  = 0.322;
+static const float gepBlackClip = 0.000;
+
+// --- Transition points (unclamped avgLum) ---
+static const float gepNightEnd   = 0.010;  // night floor, below = pure night
+static const float gepEveningMid = 0.020;  // evening target
+static const float gepDayStart   = 0.200;  // day ceiling, above = pure day
+
+// GT7-style chroma preservation factor.
+// 0.6 = 60% chroma preserved regardless of brightness compression.
+// Perceptually motivated by the Hunt effect.
+static const float gepChromaPreserve = 0.6;
 
 
-static const float midtoneGamma     = 1.0;
-static const float shadowStrength    = 0.40;
-static const float shadowNightMin    = 0.05;
-static const float shadowCeiling     = 0.06;
-static const float adaptLumLow       = 0.01;
-static const float adaptLumHigh      = 0.25;
-static const float highlightCompress = 0.0;
-static const float highlightKnee     = 0.75;
-static const float hybridBlendStart  = 0.45;
-static const float hybridBlendEnd    = 0.90;
+// =========================================================================
+// ICtCp perceptual color space conversion (ITU-T T.302)
+// =========================================================================
+// ICtCp separates intensity (I) from chrominance (Ct, Cp) using the
+// ST.2084 PQ transfer function. Better hue stability than Oklab under
+// extreme illuminant conditions (sunrise/sunset).
+//
+// DCS outputs BT.709/sRGB. ICtCp operates in BT.2020. Gamut conversion
+// matrices bracket the transform.
+//
+// Reference: ITU-T T.302, GT7/Polyphony Digital (SIGGRAPH 2025)
+// =========================================================================
 
-// Applies post-curve reshaping: gamma correction, adaptive shadow recovery,
-// and highlight rolloff.
-// Input/output: tonemapped value in [0, ~1] range.
-float reshapeCurve(float v)
+// Gamut conversion matrices
+float3 bt709ToBt2020(float3 rgb)
 {
-	// --- Midtone gamma: overall brightness/contrast correction ---
-	// pow(v, gamma) with gamma > 1 darkens proportionally across the
-	// full range.  Unlike the old desaturation hack, this operates on
-	// each value uniformly with zero color shift.
-	// At gamma=1.15:  v=0.18 → 0.155   v=0.50 → 0.452   v=0.80 → 0.768
-	v = pow(v, midtoneGamma);
-
-	// --- Adaptive shadow strength based on scene luminance ---
-	float avgLum = getAvgLuminanceClamped();
-	float adaptBlend = smoothstep(log10(adaptLumLow), log10(adaptLumHigh), log10(avgLum));
-	float strength = lerp(shadowNightMin, shadowStrength, adaptBlend);
-
-	// --- Shadow detail recovery: sqrt-proportional lift, hard-confined ---
-	if (v < shadowCeiling)
-	{
-		float t = v / shadowCeiling;
-		float sqrtMapped = shadowCeiling * sqrt(t);
-		float fade = 1.0 - t;
-		v = lerp(v, sqrtMapped, strength * fade);
-	}
-
-	// --- Highlight rolloff: soft pull-down near white only ---
-	float mask = smoothstep(highlightKnee, 1.0, v);
-	v -= highlightCompress * mask * mask;
-
-	return v;
+	return float3(
+		0.6274 * rgb.r + 0.3293 * rgb.g + 0.0433 * rgb.b,
+		0.0691 * rgb.r + 0.9195 * rgb.g + 0.0114 * rgb.b,
+		0.0164 * rgb.r + 0.0880 * rgb.g + 0.8956 * rgb.b
+	);
 }
 
-
-#if OPERATOR_LUT
-
-//https://www.desmos.com/calculator/auxwpmmq3o
-// Hybrid tonemapping: luminance-based for shadows/midtones (accurate color),
-// per-channel for highlights (natural rolloff toward white).
-// Blends between the two based on tonemapped luminance.
-float3 ToneMap_Filmic_Unrealic(float3 linearColor)
+float3 bt2020ToBt709(float3 rgb)
 {
-	const float3 LUM = { 0.2125, 0.7154, 0.0721 };
-	float lum = dot(linearColor, LUM);
-
-	if(lum <= 1e-6)
-		return 0;
-
-	// --- Luminance-based path (shadows/midtones) ---
-	float logLum = log10(lum);
-	float u = (logLum - LUTLogLuminanceMin) / (LUTLogLuminanceMax - LUTLogLuminanceMin);
-	float tonemappedLum = reshapeCurve(tonemapLUT.SampleLevel(gBilinearClampSampler, u, 0).r);
-
-	float scale = tonemappedLum / lum;
-	float3 lumResult = linearColor * scale;
-
-	// Gamut safety: ratio-preserving clamp (no hue shift)
-	float maxC = max(lumResult.r, max(lumResult.g, lumResult.b));
-	if (maxC > 1.0)
-		lumResult /= maxC;
-
-	// --- Per-channel path (highlights) ---
-	float3 logColor = log10(max(linearColor, 1e-6));
-	float uR = (logColor.r - LUTLogLuminanceMin) / (LUTLogLuminanceMax - LUTLogLuminanceMin);
-	float uG = (logColor.g - LUTLogLuminanceMin) / (LUTLogLuminanceMax - LUTLogLuminanceMin);
-	float uB = (logColor.b - LUTLogLuminanceMin) / (LUTLogLuminanceMax - LUTLogLuminanceMin);
-
-	float3 pcResult;
-	pcResult.r = reshapeCurve(tonemapLUT.SampleLevel(gBilinearClampSampler, uR, 0).r);
-	pcResult.g = reshapeCurve(tonemapLUT.SampleLevel(gBilinearClampSampler, uG, 0).r);
-	pcResult.b = reshapeCurve(tonemapLUT.SampleLevel(gBilinearClampSampler, uB, 0).r);
-
-	// --- Blend: luminance-based in shadows/mids, per-channel in highlights ---
-	float blend = smoothstep(hybridBlendStart, hybridBlendEnd, tonemappedLum);
-	return lerp(lumResult, pcResult, blend);
+	return float3(
+		 1.6605 * rgb.r - 0.5877 * rgb.g - 0.0728 * rgb.b,
+		-0.1246 * rgb.r + 1.1330 * rgb.g - 0.0084 * rgb.b,
+		-0.0182 * rgb.r - 0.1006 * rgb.g + 1.1187 * rgb.b
+	);
 }
 
-#else
+// ST.2084 PQ transfer function
+static const float PQ_REFERENCE_LUMINANCE = 100.0;
+static const float PQ_MAX_LUMINANCE = 10000.0;
+
+float pqForward(float v)
+{
+	float y = max(v * PQ_REFERENCE_LUMINANCE, 0) / PQ_MAX_LUMINANCE;
+
+	static const float m1 = 0.1593017578125;
+	static const float m2 = 78.84375;
+	static const float c1 = 0.8359375;
+	static const float c2 = 18.8515625;
+	static const float c3 = 18.6875;
+
+	float ym = pow(y, m1);
+	return pow((c1 + c2 * ym) / (1.0 + c3 * ym), m2);
+}
+
+float pqInverse(float n)
+{
+	n = clamp(n, 0, 1);
+
+	static const float m1 = 0.1593017578125;
+	static const float m2 = 78.84375;
+	static const float c1 = 0.8359375;
+	static const float c2 = 18.8515625;
+	static const float c3 = 18.6875;
+
+	float np = pow(n, 1.0 / m2);
+	float l = max(np - c1, 0) / (c2 - c3 * np);
+	l = pow(l, 1.0 / m1);
+
+	return l * PQ_MAX_LUMINANCE / PQ_REFERENCE_LUMINANCE;
+}
+
+// ICtCp conversion
+float3 linearRGBToICtCp(float3 rgb709)
+{
+	float3 rgb2020 = bt709ToBt2020(rgb709);
+
+	float l = (rgb2020.r * 1688.0 + rgb2020.g * 2146.0 + rgb2020.b * 262.0) / 4096.0;
+	float m = (rgb2020.r * 683.0  + rgb2020.g * 2951.0 + rgb2020.b * 462.0) / 4096.0;
+	float s = (rgb2020.r * 99.0   + rgb2020.g * 309.0  + rgb2020.b * 3688.0) / 4096.0;
+
+	float lPQ = pqForward(l);
+	float mPQ = pqForward(m);
+	float sPQ = pqForward(s);
+
+	return float3(
+		(2048.0 * lPQ + 2048.0 * mPQ) / 4096.0,
+		(6610.0 * lPQ - 13613.0 * mPQ + 7003.0 * sPQ) / 4096.0,
+		(17933.0 * lPQ - 17390.0 * mPQ - 543.0 * sPQ) / 4096.0
+	);
+}
+
+float3 iCtCpToLinearRGB(float3 ictcp)
+{
+	float lPQ = ictcp.x + 0.00860904 * ictcp.y + 0.11103 * ictcp.z;
+	float mPQ = ictcp.x - 0.00860904 * ictcp.y - 0.11103 * ictcp.z;
+	float sPQ = ictcp.x + 0.560031 * ictcp.y - 0.320627 * ictcp.z;
+
+	float l = pqInverse(lPQ);
+	float m = pqInverse(mPQ);
+	float s = pqInverse(sPQ);
+
+	float3 rgb2020 = float3(
+		max( 3.43661 * l - 2.50645 * m + 0.06985 * s, 0),
+		max(-0.79133 * l + 1.98360 * m - 0.19227 * s, 0),
+		max(-0.02595 * l - 0.09891 * m + 1.12486 * s, 0)
+	);
+
+	return bt2020ToBt709(rgb2020);
+}
+
+
+// =========================================================================
+// Hable Piecewise Filmic Curve (adaptive parameters)
+// =========================================================================
+// Toe and shoulder are power curve segments joined at a slope-controlled
+// junction. The curve operates in log10 luminance space.
+//
+// Parameters adapt to scene brightness via two-stage smoothstep:
+//   Night -> Evening -> Day
+//
+// Reference: John Hable, "Filmic Tonemapping with Piecewise Power Curves"
+// http://filmicworlds.com/blog/filmic-tonemapping-with-piecewise-power-curves/
+// =========================================================================
 
 float Curve(float c0, float c1, float ca, float curveSlope, float X)
 {
@@ -192,56 +240,102 @@ float Curve(float c0, float c1, float ca, float curveSlope, float X)
 
 float TonemapFilmic(float logLuminance)
 {
-	float ta = (1-toe - 0.18) / slope - 0.733;
-	float sa = (shoulder - 0.18) / slope - 0.733;
+	// Two-stage interpolation keyed off unclamped avgLum.
+	// Night -> Evening: smoothstep(nightEnd, eveningMid)
+	// Evening -> Day:   smoothstep(eveningMid, dayStart)
+	float avgLum = max(getAverageLuminance(), 0.001);
+	float tNightToEvening = smoothstep(gepNightEnd, gepEveningMid, avgLum);
+	float tEveningToDay   = smoothstep(gepEveningMid, gepDayStart, avgLum);
 
-	float t = 1 + blackClip - toe;
-	float s = 1 + whiteClip - shoulder;
+	float curveSlope = lerp(lerp(gepNightSlope,     gepEveningSlope,     tNightToEvening), gepDaySlope,     tEveningToDay);
+	float curveToe   = lerp(lerp(gepNightToe,       gepEveningToe,       tNightToEvening), gepDayToe,       tEveningToDay);
+	float curveWC    = lerp(lerp(gepNightWhiteClip,  gepEveningWhiteClip, tNightToEvening), gepDayWhiteClip, tEveningToDay);
 
-	if(logLuminance < ta)
-		return Curve(toe, blackClip, ta, -slope, logLuminance);
-	else if(logLuminance < sa)
-		return slope * (logLuminance + 0.733) + 0.18;
+	float ta = (1 - curveToe - 0.18) / curveSlope - 0.733;
+	float sa = (gepShoulder - 0.18) / curveSlope - 0.733;
+
+	if (logLuminance < ta)
+		return Curve(curveToe, gepBlackClip, ta, -curveSlope, logLuminance);
+	else if (logLuminance < sa)
+		return curveSlope * (logLuminance + 0.733) + 0.18;
 	else
-		return 1 - Curve(shoulder, whiteClip, sa, slope, logLuminance);
+		return 1 - Curve(gepShoulder, curveWC, sa, curveSlope, logLuminance);
 }
 
-//https://www.desmos.com/calculator/auxwpmmq3o
-// Hybrid tonemapping: luminance-based for shadows/midtones (accurate color),
-// per-channel for highlights (natural rolloff toward white).
+
+// =========================================================================
+// GEP: Perceptual color volume tonemapping (ICtCp)
+// =========================================================================
+// The Hable curve is applied to scalar luminance in log10 space. ICtCp
+// decomposes color into intensity and chrominance on perceptually uniform
+// axes. Chroma is scaled using GT7's linear preservation blend
+// (gepChromaPreserve), providing a perceptual floor that prevents visible
+// desaturation for moderate brightness compression while still
+// desaturating extreme highlights toward white.
+//
+// Near-black fallback: PQ has finite slope at zero (stable), but
+// BT.709-to-BT.2020 rounding can shift color at very low values.
+// Blend to simple luminance scaling below lum 0.005.
+//
+// Near-neutral protection: ICtCp round-trip through BT.2020 can
+// produce pinkish tint on near-gray content (concrete, clouds) due
+// to small gamut conversion rounding errors amplified on near-zero
+// chroma. Blend to simple scaling when chroma magnitude is tiny.
+// =========================================================================
+
 float3 ToneMap_Filmic_Unrealic(float3 linearColor)
 {
 	const float3 LUM = { 0.2125, 0.7154, 0.0721 };
 	float lum = dot(linearColor, LUM);
 
-	if(lum <= 1e-6)
+	if (lum <= 1e-6)
 		return 0;
 
-	// --- Luminance-based path (shadows/midtones) ---
+	// Apply the Hable curve to scalar luminance
 	float logLum = log10(lum);
-	float tonemappedLum = reshapeCurve(TonemapFilmic(logLum));
+	float tonemappedLum = TonemapFilmic(logLum);
 
+	// Simple luminance scaling path (always stable, hue-preserving)
 	float scale = tonemappedLum / lum;
-	float3 lumResult = linearColor * scale;
+	float3 simpleResult = max(linearColor * scale, 0);
 
-	// Gamut safety: ratio-preserving clamp (no hue shift)
-	float maxC = max(lumResult.r, max(lumResult.g, lumResult.b));
-	if (maxC > 1.0)
-		lumResult /= maxC;
+	// Near-black: BT.709-to-BT.2020 rounding at very low values
+	float ictcpBlend = smoothstep(0.001, 0.005, lum);
 
-	// --- Per-channel path (highlights) ---
-	float3 logColor = log10(max(linearColor, 1e-6));
-	float3 pcResult;
-	pcResult.r = reshapeCurve(TonemapFilmic(logColor.r));
-	pcResult.g = reshapeCurve(TonemapFilmic(logColor.g));
-	pcResult.b = reshapeCurve(TonemapFilmic(logColor.b));
+	// ICtCp path: perceptually uniform intensity/chroma decomposition
+	float3 ictcp = linearRGBToICtCp(linearColor);
+	float I_in = ictcp.x;
 
-	// --- Blend: luminance-based in shadows/mids, per-channel in highlights ---
-	float blend = smoothstep(hybridBlendStart, hybridBlendEnd, tonemappedLum);
-	return lerp(lumResult, pcResult, blend);
+	float I_out = linearRGBToICtCp(float3(tonemappedLum, tonemappedLum, tonemappedLum)).x;
+
+	// GT7-style linear chroma preservation blend.
+	// gepChromaPreserve = 0.6: 60% chroma preserved regardless of compression.
+	// Perceptually motivated by the Hunt effect.
+	float I_ratio = (I_in > 1e-6) ? (I_out / I_in) : 0;
+
+	// Fade the chroma floor for extreme compression.
+	// At moderate compression (I_ratio 0.3-1.0), full preserve active.
+	// At extreme compression (I_ratio < 0.1), preserve fades toward
+	// zero, letting the sun and extreme highlights desaturate to white.
+	float preserveFade = smoothstep(0.02, 0.15, I_ratio);
+	float effectivePreserve = gepChromaPreserve * preserveFade;
+	float chromaScale = I_ratio * (1.0 - effectivePreserve) + effectivePreserve;
+	float2 ctcp_out = ictcp.yz * chromaScale;
+
+	float3 ictcpResult = max(iCtCpToLinearRGB(float3(I_out, ctcp_out)), 0);
+
+	// Near-neutral protection: ICtCp round-trip on near-gray content
+	// can produce pinkish tint from BT.2020 gamut conversion rounding.
+	float chromaMagnitude = length(ictcp.yz);
+	float neutralBlend = smoothstep(0.001, 0.01, chromaMagnitude);
+
+	return lerp(simpleResult, ictcpResult, neutralBlend * ictcpBlend);
 }
 
-#endif
+
+// =========================================================================
+// Alternative tonemap operators (required by toneMap() switch)
+// =========================================================================
 
 float3 ToneMap_Hable(float3 x)
 {
@@ -263,30 +357,38 @@ float3 ToneMap_atmHDR(float3 L) {
 float3 ToneMap_Linear(float3 L) {
 	return L;
 }
-//https://www.desmos.com/calculator/auxwpmmq3o
+
 float3 ToneMap_Exp(float3 L) {
 	return pow(max(0, 1 - exp(-L*tmPower)), tmExp);
 }
-//https://www.desmos.com/calculator/auxwpmmq3o
+
 float3 ToneMap_Exp2(float3 L) {
 	return (1 - exp(-L*tmPower)) * (1 - exp(-L*tmExp));
 }
 
+
+// =========================================================================
+// Tonemap operator switch (called by Tonemap.fx)
+// =========================================================================
+
 float3 toneMap(float3 linearColor, uniform int tonemapOperator)
 {
 	float3 tonmappedColor;
-	
+
 	switch(tonemapOperator)
 	{
-	case TONEMAP_OPERATOR_LINEAR:		tonmappedColor = ToneMap_Linear(linearColor); break;
-	case TONEMAP_OPERATOR_EXPONENTIAL:	tonmappedColor = ToneMap_Exp(linearColor); break;
-	case TONEMAP_OPERATOR_FILMIC:		tonmappedColor = ToneMap_Filmic_Unrealic(linearColor); break;
-	// case TONEMAP_OPERATOR_FILMIC:		tonmappedColor = ToneMap_Filmic_JohnHable(linearColor); break;
-	// case TONEMAP_OPERATOR_CUSTOM:		tonmappedColor = ToneMap_Custom(linearColor); break;
+	case TONEMAP_OPERATOR_LINEAR:       tonmappedColor = ToneMap_Linear(linearColor); break;
+	case TONEMAP_OPERATOR_EXPONENTIAL:  tonmappedColor = ToneMap_Exp(linearColor); break;
+	case TONEMAP_OPERATOR_FILMIC:       tonmappedColor = ToneMap_Filmic_Unrealic(linearColor); break;
 	}
 
 	return tonmappedColor;
 }
+
+
+// =========================================================================
+// Simple tonemap paths (FLIR, MFD, etc)
+// =========================================================================
 
 float3 simpleToneMapFLIR(float3 color, uniform bool gammaSpace) {
 	float averageLuminance = avgLuminance[LUMINANCE_AVERAGE].x;
@@ -307,7 +409,9 @@ float3 simpleToneMap(float3 color) {
 }
 
 
-
+// =========================================================================
+// Debug drawing functions
+// =========================================================================
 
 #define drawGrid(uv, eps) ((abs(uv.x-0.5)<eps || abs(uv.x-1.0)<eps || abs(uv.x-1.5)<eps || abs(uv.y - 0.5)<eps) ? 1.0 : 0.0)
 
@@ -345,7 +449,6 @@ void plotQuad(float2 pixel, float2 quadBottomLeft, float2 quadSize, float4 color
 float LuminanceToHistogramPos(float luminance)
 {
 	float logLuminance = log2(luminance);
-	// return saturate((logLuminance - inputLuminanceMin) / (inputLuminanceMax - inputLuminanceMin));
 	return saturate(logLuminance * inputLuminanceScaleOffset.x + inputLuminanceScaleOffset.y);
 }
 
@@ -354,28 +457,19 @@ void debugDraw(float2 uvNorm, float2 pixel, inout float3 sourceColor)
 #ifdef PLOT_TONEMAP_FUNCION
 	const float plotOpacity = 0.7;
 	float2 p = uvNorm * float2(2.5, 1);
-	// p.x = exp2((p.x-1.5) * 5);
 	p.x = pow(10, (p.x-1.5) * 2);
-	// plotGrid(p, sourceColor, float4(0,0,0, 0.2*plotOpacity));
-	// plotFunction(uvNorm, p, ToneMap_Custom, sourceColor, float4(1,0,0,0.5*plotOpacity));
-	// plotFunction(uvNorm, p, ToneMap_atmHDR, sourceColor, float4(0,1,0,0.5*plotOpacity));
-	// plotFunction(uvNorm, p, ToneMap_Linear, sourceColor, float4(0,1,0,0.5*plotOpacity));
-	// plotFunction(uvNorm, p, ToneMap_Exp, sourceColor, float4(0,0,1,0.5*plotOpacity));
 	plotFunction(uvNorm, p, ToneMap_Filmic_Unrealic, sourceColor, float4(0,0,1,0.5*plotOpacity));
-	// plotFunction(uvNorm, p, ToneMap_Filmic_JohnHable, sourceColor, float4(0,0,0, 0.5*plotOpacity));
 #endif
 
 #ifdef PLOT_AVERAGE_LUMINANCE
 	float2 lumPix = pixel;
 	lumPix.y = 768 - lumPix.y;
 	plotNumber(lumPix, getAvgLuminanceClamped(), sourceColor);
-	// plotNumber(lumPix, log2(getAvgLuminanceClamped()+expOffset), sourceColor);
-	// plotNumber(lumPix, histogram[1]/1000.0, sourceColor);
 #endif
 
 #ifdef PLOT_HISTOGRAM
-	const float2 histogramPos = {50, 400};// from screen top-left, px
-	const float2 histogramSize = {200, 150};//px, px
+	const float2 histogramPos = {50, 400};
+	const float2 histogramSize = {200, 150};
 	const uint nHistogramBins = 32;
 	const float4 histogramColor = float4(0.7,1,0,0.5);
 	const float4 borderColor = float4(0.7,1,0,0.5);
@@ -388,17 +482,16 @@ void debugDraw(float2 uvNorm, float2 pixel, inout float3 sourceColor)
 	for(uint i=0; i<nHistogramBins; ++i)
 		plotQuad(hisPix, float2(histogramPos.x + (binWidth+1)*i, 0), float2(binWidth, 4*histogramSize.y*histogram[i]/1.0), histogramColor, sourceColor);
 	float2 size = float2((binWidth+1)*nHistogramBins, histogramSize.y);
-	plotQuad(hisPix, float2(histogramPos.x, 0),			 float2(1, size.y),			 borderColor, sourceColor);
+	plotQuad(hisPix, float2(histogramPos.x, 0),          float2(1, size.y),          borderColor, sourceColor);
 	plotQuad(hisPix, float2(histogramPos.x + size.x, 0), float2(1, histogramSize.y), borderColor, sourceColor);
-	plotQuad(hisPix, float2(histogramPos.x, -1),		 float2(size.x, 1),			 borderColor, sourceColor);
-	plotQuad(hisPix, float2(histogramPos.x, size.y),	 float2(size.x, 1),			 borderColor, sourceColor);
-	
+	plotQuad(hisPix, float2(histogramPos.x, -1),         float2(size.x, 1),          borderColor, sourceColor);
+	plotQuad(hisPix, float2(histogramPos.x, size.y),     float2(size.x, 1),          borderColor, sourceColor);
+
 	float pos = LuminanceToHistogramPos(avgLuminance[LUMINANCE_AVERAGE].x);
-	plotQuad(hisPix, float2(histogramPos.x + pos * size.x, 0),			float2(1, size.y),	float4(1,1,1,0.7), sourceColor);
-	plotQuad(hisPix, float2(histogramPos.x + percentMin * size.x, 0),	float2(1, size.y),	float4(0,0,1,0.2), sourceColor);
-	plotQuad(hisPix, float2(histogramPos.x + percentMax * size.x, 0),	float2(1, size.y),	float4(0,0,1,0.2), sourceColor);
+	plotQuad(hisPix, float2(histogramPos.x + pos * size.x, 0),        float2(1, size.y), float4(1,1,1,0.7), sourceColor);
+	plotQuad(hisPix, float2(histogramPos.x + percentMin * size.x, 0), float2(1, size.y), float4(0,0,1,0.2), sourceColor);
+	plotQuad(hisPix, float2(histogramPos.x + percentMax * size.x, 0), float2(1, size.y), float4(0,0,1,0.2), sourceColor);
 #endif
 }
-
 
 #endif

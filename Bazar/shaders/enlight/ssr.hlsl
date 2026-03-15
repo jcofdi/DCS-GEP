@@ -1,5 +1,6 @@
 #ifndef SSR_ONCE
 #define SSR_ONCE
+#include "common/dithering.hlsl"
 
 	#ifdef MSAA
 		Texture2DMS<float4, MSAA> prevHDRBuffer;
@@ -103,19 +104,24 @@
 	}
 
 	float rand(float3 vsPos) {
-		// Interleaved Gradient Noise (Jimenez 2014) with temporal golden-ratio
-		// animation. Derive screen-space pixel coordinates from the view-space
-		// position via projection so that adjacent pixels get properly
-		// decorrelated noise even on flat surfaces where the reflection
-		// direction barely changes between neighbors.
+		// Interleaved Gradient Noise (Jimenez 2014). Derive screen-space pixel
+		// coordinates from the view-space position via projection so that
+		// adjacent pixels get properly decorrelated noise even on flat surfaces
+		// where the reflection direction barely changes between neighbors.
 		float4 proj = mul(float4(vsPos, 1), gProj);
 		float2 screenPix = float2(proj.x, -proj.y) / proj.w * 0.5 + 0.5;
-		screenPix *= 2048.0; // scale to pixel-range for IGN spacing
-		float framePhase = frac(gModelTime * 7.23);
-		float ign = frac(52.9829189 * frac(
-			dot(screenPix, float2(0.06711056, 0.00583715))
-		));
-		return frac(ign + framePhase * 0.6180339887);
+		screenPix *= 2048.0;
+	#ifdef SSR_STATIC_NOISE
+		// Model path: no temporal accumulation available, so static noise
+		// prevents per-frame sparkle. The csFilterMip spatial blur averages
+		// over the fixed per-pixel offsets to produce a clean result.
+		return interleavedGradientNoise(screenPix, 0.0);
+	#else
+		// Water path: temporal accumulation via mixPrevFrame() consumes the
+		// per-frame variation. Golden-ratio offset decorrelates each frame's
+		// pattern for optimal convergence over ~10 frames.
+		return interleavedGradientNoise(screenPix, gModelTime);
+	#endif
 	}
 	
 	#if 1
@@ -141,10 +147,7 @@
 #endif
 
 float4 RAYMARCH(float3 pos, float3 dir, float offset)
-{ // in view space, dir must be normalized 
-
-	float3 v = normalize(pos);
-	float3 dv = abs(dot(v, dir));
+{ // in view space, dir must be normalized
 
 #if 1
 	float jitterStep = (1 + (rand(pos)-0.25)) * stepSize;
@@ -169,12 +172,24 @@ float4 RAYMARCH(float3 pos, float3 dir, float offset)
 
 		float3 rayEnd = pos + dir * t;
 		float2 screenCoord = getScreenCoord(rayEnd);
+
+		// Early-out: ray exited the viewport. DepthSampler BORDER mode
+		// returns 0 for OOB reads, which getDepth() reconstructs as a
+		// near-plane Z value — causing false hits at screen borders.
+		if (any(screenCoord < 0) || any(screenCoord > 1))
+			return 0;
+
 		float depth = getDepth(screenCoord);
 		float delta = rayEnd.z - depth - 0.5;	// -0.5 fix water to water reflection
 		float delta2 = depth - pos.z + offset;
 //		if (delta > 0) {
 		if (delta > 0 && delta2 > lerp(delta, 0, saturate(rayEnd.z*0.0002)) ) {		// 5km far to check delta2 
-
+			// [MOD] Reject SSR hits at extreme depth (sky, clouds, far plane).
+			// Screen-space reflections have no physical validity for objects
+			// tens of km away -- those should come from the environment map.
+			// Threshold ~10km in view-space Z; anything beyond is atmosphere.
+			if (depth > 50000.0)
+				continue;
 			// Binary search refinement: bisect between previous step (in front)
 			// and current step (behind surface) to converge on intersection.
 			// 5 iterations reduce positional error by 32x.

@@ -7,7 +7,7 @@ shadingEditor = 0;
 options = 
 {
 	initItemsCount = 400;
-	maxSuperficialsPerFrame = 8;
+	maxSuperficialsPerFrame = 10;
 	vehiclesDecimation = 1;
 	flatShadowsLayerInFinalColorPass = 13;
 }
@@ -65,10 +65,10 @@ distances =
 		lod0 = 200.0;
 		lod1 = 600.0;
 		blend = 2000.0;
-		far = 2010.0;
+		far = 2500.0;
 	};
 
---	asyncPreloadRadius = 80000.0;  -- JC: noted but left commented; see first file notes
+--	asyncPreloadRadius = 80000.0;  -- ED Commented out - user setting overrides.
 }
 lights = 
 {
@@ -122,25 +122,21 @@ weather =
 	windSpeed = 5;
 }
 
--- =============================================================================
--- CLIPMAP CONFIGURATION
--- JC: Quality = 2 (2048px textures, 4x area improvement over stock)
--- =============================================================================
-clipmapQuality = 2  -- was 1; 2 = 2048px textures (4x area, 2x linear resolution)
+clipmapQuality = 1
 
 clipmap = 
 {
 	loggingEnabled = false;
 	maxUpdatePerFrame = 10;
-	interlaced = 3;
+	interlaced = 1;
 	updateToGPU = 15;
 	updateFlagsToGPU = true;
 }
 
 updatesClipmapPerFrame = 1
 clipmapsForcedRGBA = false
-clipmapTextureSize = 1024 * clipmapQuality  -- 2048 for JC (Q=2)
-clipmapUpdateStep = 32 * clipmapQuality     -- 64 for JC (Q=2)
+clipmapTextureSize = 1024 * clipmapQuality
+clipmapUpdateStep = 32 * clipmapQuality
 clipmaptextures =	
 {
 	colortexture = 
@@ -230,17 +226,17 @@ instancer =
 {
 	computeStrategy = "single";
 
-	bufferSize = 30000;
+	bufferSize = 40000;
 	checkBufferSize = false;
 
-	multiAppendBufferSize = 524288;
-	parentBufferSize = 20000;
-	childsBufferSize = 100000;
+	multiAppendBufferSize = 786432;
+	parentBufferSize = 30000;
+	childsBufferSize = 150000;
 
 	vertexInstancer = true;
 	geometryReference = true;
 
-	singleBufferSize = 4194304;
+	singleBufferSize = 6291456;
 	singleBlockSize = 128;
 }
 

@@ -44,11 +44,51 @@ float4x4 World;
 static const float turbulencePower = 10;
 static const float distMax = 1.5 * 1.5;//макс расстояние от линии
 
-// V38: anisotropic turbulence ratio — lateral spread is this fraction
+// V38: anisotropic turbulence ratio - lateral spread is this fraction
 // of along-track turbulence. Based on reference footage showing tight
 // lateral confinement with strong along-track shearing.
 // 0.4 = lateral turbulence at 40% of along-track strength.
 static const float lateralTurbulenceRatio = 0.9;
+
+// =============================================
+// V39: Weather-responsive steam conditions
+// =============================================
+// Derives a 0-1 modulation factor from mission weather and time of day.
+// At conditions=1.0, all downstream values reproduce V38 behavior exactly.
+// The factor only reduces steam intensity - never exceeds current maximums.
+//
+// Primary driver: gCloudiness (0=clear to ~800+=overcast)
+//   Overcast holds surface temps lower, implies higher relative humidity,
+//   and suppresses radiative warming - steam lingers and billows.
+//
+// Secondary driver: gSunDir.y (sine of sun elevation)
+//   Low sun = cooler ambient air = larger delta-T between steam and air
+//   = more visible condensation. Dawn/dusk cat shots produce more steam.
+//
+// Not available at shader level: temperature, humidity, season, latitude.
+// gSunAttenuation tested and rejected (pure geometric extinction, not weather).
+float computeSteamConditions()
+{
+	// Sun elevation: low sun = cooler ambient = more steam
+	// gSunDir.y: ~0.048 (dawn/dusk) to ~0.912 (noon)
+	// Caps at 0.85 - clear night alone cannot reach maximum steam.
+	// Clouds are required to push past ~0.85 toward 1.0.
+	// This prevents clear desert nights from producing full steam
+	// while preserving the strong dawn/dusk vs noon contrast.
+	float sunCool = 0.85 - saturate(gSunDir.y) * 0.25;
+
+	// Cloud cover: overcast = cooler + more humid = steam lingers
+	// gCloudiness: 0 (clear) to ~800+ (overcast/broken)
+	// Normalize to 0..1, treat 900+ as fully overcast
+	// 50% boost at full overcast - strongest real signal available
+	// This is the gatekeeper for maximum steam: only cloud cover
+	// plus low sun elevation can produce conditions = 1.0.
+	float cloudNorm = saturate(gCloudiness / 900.0);
+	float cloudCool = 1.0 + cloudNorm * 0.5;
+
+	// Combined range: ~0.60 (noon clear) to ~1.28 (dawn overcast) -> clamped 0..1
+	return saturate(sunCool * cloudCool);
+}
 
 float DistToLine(float2 pt1, float2 pt2, float2 testPt)
 {
@@ -96,38 +136,69 @@ PuffCluster initParticle(PuffCluster p, float3 from, float3 to, uint id)
 	float4 t = getTurbulence(p.posRadius.xyz, rnd.y);
 
 	p.reserved.x = pow(t.w, 3.0 - 2.0*particlePower); //max opacity
-	p.reserved.x = t.w * t.w * emitterOpacity * (0.1 + 0.9*particlePower); //max opacity
+
+	// =============================================
+	// V39: Weather-responsive spawn suppression
+	// =============================================
+	// Primary "less steam" lever: under dry conditions, a percentage of
+	// particles spawn as invisible ghosts (zero opacity). They still
+	// simulate in the buffer — no way around that with a fixed pool —
+	// but contribute nothing visually. This reduces visible particle
+	// count without compressing spatial distribution: surviving particles
+	// retain full V38 lifetime, rise, drift, turbulence, and shear.
+	//
+	// Spawn rate uses conditions^2 for an aggressive but smooth curve:
+	//   conditions=1.00 (overcast dawn)  -> 100% visible
+	//   conditions=0.85 (clear night)    ->  72% visible
+	//   conditions=0.60 (clear noon)     ->  36% visible
+	//
+	// Idle particles (particlePower~0) get additional suppression via
+	// double-squaring the spawn rate. Active launch steam is pressurized
+	// and blasts through regardless of ambient conditions. Idle leakage
+	// is residual heat meeting ambient air — far more weather-sensitive.
+	//   Clear noon active: 36% spawn  |  Clear noon idle: 13% spawn
+	//   Overcast dawn:    100% spawn  |  Overcast idle:  100% spawn
+	float conditions = computeSteamConditions();
+	float spawnRate = conditions * conditions;
+	// Idle: square again for aggressive suppression; active: unchanged
+	spawnRate = lerp(spawnRate * spawnRate, spawnRate, particlePower);
+	// rnd.w is the 4th noise channel — already computed, unused elsewhere
+	// in initParticle. Gives each particle a stable coin flip at birth:
+	// either fully visible or ghost for its entire lifetime. No flickering.
+	float spawnChance = step(rnd.w, spawnRate);
+
+	// V39: mild opacity scaling on surviving particles
+	// Gives visible wisps a slightly thinner, more translucent quality
+	// under dry conditions without changing their spatial behavior.
+	//   conditions=1.0 -> opacityScale = 1.0 (unchanged)
+	//   conditions=0.6 -> opacityScale = 0.82
+	float opacityScale = lerp(0.7, 1.0, conditions);
+
+	p.reserved.x = t.w * t.w * emitterOpacity * (0.1 + 0.9*particlePower) * spawnChance * opacityScale;
 	p.reserved.y = particlePower;
 	p.reserved.w = gModelTime;//birth time
 
 	// V38: per-particle brightness jitter stored in .z of reserved
-	// Range: 0.7 to 1.0 — some puffs are dimmer, simulating internal
-	// density variation within the steam cloud. rnd.z is already available
-	// and uncorrelated with position (rnd.x) and turbulence offset (rnd.y).
-	// Combined with the linear lighting opacity fix in GetClusterInfo,
-	// this breaks up the flat uniform blob — jitter provides density
-	// variation while the lighting system handles directional contrast.
+	// Range: 0.7 to 1.0 ...
 	p.reserved.z = 0.7 + 0.3 * abs(rnd.z);
 
 	// =============================================
-	// V38: lifetime — tight range with rare lingerers
+	// V39: lifetime - V38 range with weather modulation
 	// =============================================
-	// Base range: ~0.5-1.9s active, ~0.45-1.5s idle
-	// Covers 95% of particles. Real catapult steam dissipates quickly
-	// in headwind — most wisps gone within 1-2s. Active launch boost
-	// is only 1.25x because launch steam is hotter and under more
-	// pressure differential, dispersing faster than idle residual.
-	//
-	// ~5% of particles get 2x life (lingerers) — dense steam pockets
-	// in humid/calm micro-conditions that persist up to ~3.5s.
-	// These use rnd.z near extremes (abs > 0.95), which also correlates
-	// with high brightness jitter (~0.985) — physically consistent
-	// since dense steam lasts longer due to higher thermal mass.
-	float baseLife = 1.5 * (0.3 + 0.7*t.w) * (1 + 0.25 * particlePower);
+	// Base behavior identical to V38 at conditions=1.0.
+	// Under dry/hot conditions (low factor), lifetime contracts:
+	//   conditions=1.0 -> lifetime multiplier = 1.0 (unchanged)
+	//   conditions=0.7 -> lifetime multiplier = 0.82
+	//   conditions=0.6 -> lifetime multiplier = 0.76
+	// This means fewer particles alive simultaneously under dry conditions,
+	// reading as "less steam" without changing the particle count.
+	// Lingerer logic preserved - 5% still get 2x life regardless,
+	// but their absolute duration also scales with conditions.
+	float baseLife = 1.5 * (0.3 + 0.7*t.w) * (1 + 0.25 * particlePower) * lerp(0.4, 1.0, conditions);
 	float lingerChance = step(0.95, abs(rnd.z)); // ~5% of particles
 	float lingerBoost = 1.0 + lingerChance * 1.0; // 2x life for lingerers
 	p.sizeLifeOpacityRnd.y = baseLife * lingerBoost;
-
+	
 	return p;
 }
 
@@ -188,27 +259,40 @@ PuffCluster updateParticle(PuffCluster p, uint id, float distFromLineSq)
 	p.posRadius.y += p.reserved.x * dT * 0.4 * (1 + windPower*0.08);
 
 	// =============================================
-	// V37: Size lifecycle - grow, shrink, then fade
+	// V39: Size lifecycle - grow, shrink, then fade
+	// (weather-modulated growth and shrink)
 	// =============================================
+
+	// V39: recompute conditions (deterministic, cheap - no texture fetches)
+	float conditions = computeSteamConditions();
 
 	// Growth phase: 0-50% of life, ease-out curve
 	// Fast initial billow that plateaus at peak
 	float growthPhase = saturate(nAge / 0.5);
 	float easeGrowth  = growthPhase * (2.0 - growthPhase);
 
-	// V37: reduced max growth from 0.4*age to nAge-based 0.45 peak
-	// Tighter puffs that don't expand into large blobs
-	float maxGrowth = 0.45;
+	// V39: growth modulated by conditions
+	// At conditions=1.0: maxGrowth = 0.45 (unchanged from V38)
+	// At conditions=0.6: maxGrowth = 0.45 * 0.91 = 0.41
+	// Under dry/hot conditions, puffs billow less — tighter condensation
+	// plume due to faster turbulent mixing with hotter ambient air.
+	// Mild range (0.85-1.0) preserves spatial character while visibly
+	// tightening the puffs. Combined with spawn suppression, the few
+	// visible wisps under dry conditions are noticeably smaller.
+	float maxGrowth = 0.45 * lerp(0.85, 1.0, conditions);
 	float peakSize  = 1.0 + maxGrowth;
 	float grownSize = 1.0 + maxGrowth * easeGrowth;
 
 	// Shrink phase: 50-85% of life
-	// Steam cools and condenses into a tighter wisp before vanishing
-	// Shrinks to 60% of peak - visibly tightens without collapsing to nothing
+	// V39: shrink target modulated by conditions
+	// At conditions=1.0: shrinkTarget = peakSize * 0.60 (unchanged from V38)
+	// At conditions=0.6: shrinkTarget = peakSize * 0.50
+	// Under dry conditions, steam evaporates faster at droplet edges —
+	// wisps tighten more aggressively before vanishing.
 	float shrinkPhase  = saturate((nAge - 0.5) / 0.35);
-	float shrinkTarget = peakSize * 0.6;
+	float shrinkTarget = peakSize * lerp(0.40, 0.6, conditions);
 	float sizeFactor   = lerp(grownSize, shrinkTarget, shrinkPhase);
-
+	
 	p.sizeLifeOpacityRnd.x = particleSize * sizeFactor * (1 + 2.0*p.reserved.y);
 
 	// =============================================

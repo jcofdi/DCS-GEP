@@ -158,6 +158,9 @@ VFSTexturePaths =
 	"./Bazar/World/textures/lantirn",
     "./Bazar/World/textures/Prgm-5.zip",
     "./Bazar/World/textures/Prgm-5_p_1.zip",
+	"./Bazar/World/textures/flat_earth.zip",
+	"./Bazar/World/textures/ural_atz-10_p_1.zip",
+	"./Bazar/World/textures/ural_atz-10.zip",		
 }
 
 ModelPaths =
@@ -276,17 +279,14 @@ Camera =
         lodMult = 1.0;
         lodAdd = 0;
     };
-
 	-- =========================================================================
-	-- JC OPUS CAMERA PROFILE
+	-- GEP CAMERA PROFILE
 	-- Extended visibility distances based on 80km atmospheric ceiling
 	-- Trees: wider fade zone for forest silhouettes at altitude
 	-- Districts: 13km fade zone instead of hard cutoff at 12km
 	-- Lights: fade-start pulled in 50m for approach lighting fidelity
-	-- lodMult 1.5: pushes per-object LOD switches 50% further
-	-- lodAdd 100: prevents LOD popping within 100m of camera
 	-- =========================================================================
-	JC =
+	GEP =
 	{
 		near_clip = 0.02;
 		far_clip = 150000;
@@ -415,7 +415,7 @@ CameraMirrors =
     };
 
 	-- JC Opus mirror profile (scaled down from main JC profile)
-	JC =
+	GEP =
 	{
 		thisIsMirror = true;
 		near_clip = 0.02;
@@ -448,7 +448,7 @@ Terrain =
 		High = 1.0;
 		Ultra = 1.2;
 		Extreme = 1.5;
-		JC = 1.5;  -- JC Opus: maximum terrain streaming multiplier for 80km vis
+		GEP = 1.5;  -- GEP: maximum terrain streaming multiplier for 80km vis
 	};
 	
 	civTraffic = {		

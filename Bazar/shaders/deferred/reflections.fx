@@ -23,6 +23,7 @@ bool isWater(uint materialID) {
 	return (materialID & STENCIL_COMPOSITION_MASK) == STENCIL_COMPOSITION_WATER;
 }
 
+#define SSR_STATIC_NOISE 1
 #define SSR_Depth DepthMap
 #include "enlight/ssr.hlsl"
 #define SSR_GetColor getPrevFrameColor
@@ -45,29 +46,56 @@ VS_OUTPUT VS(uint vid: SV_VertexID) {
 	return o;
 }
 
+// Attempt to get temporal resolution on SSLR reflections
+Texture2D prevReflection;
+
 float4 PS_REFLECTION(VS_OUTPUT i, uniform bool usePrevHDRBuffer = false) : SV_TARGET0
 {
-	float2 uv = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
-	float2 tuv = transformColorBufferUV(uv) + 0.5;	// center of pixel
+    float2 uv = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
+    float2 tuv = transformColorBufferUV(uv) + 0.5;
 
-	uint matID = LoadStencil(tuv) & (STENCIL_COMPOSITION_MASK | 7);	// stencil lean in G only on ATI video card
-	if (matID != (STENCIL_COMPOSITION_MODEL | 1)
+    uint matID = LoadStencil(tuv) & (STENCIL_COMPOSITION_MASK | 7);
+    if (matID != (STENCIL_COMPOSITION_MODEL | 1)
 #if !USE_COCKPIT_CUBEMAP
-		&& matID != STENCIL_COMPOSITION_COCKPIT
+        && matID != STENCIL_COMPOSITION_COCKPIT
 #endif
-		)
-		return float4(0, 0, 0, 0);
-	float depth = LoadDepth(tuv);
-	float4 NDC = float4(i.projPos.xy, depth, 1);
+        )
+        return float4(0, 0, 0, 0);
+    float depth = LoadDepth(tuv);
+    float4 NDC = float4(i.projPos.xy, depth, 1);
 
-	float3 wsNormal = DecodeNormal(tuv, 0);
+    float3 wsNormal = DecodeNormal(tuv, 0);
 
-	if (usePrevHDRBuffer)
-		return getSSR_getPrevFrameColor(NDC, wsNormal, 0.5);
-	else
-		return getSSR(NDC, wsNormal, 0.5);
+    float4 refl;
+    if (usePrevHDRBuffer)
+        refl = getSSR_getPrevFrameColor(NDC, wsNormal, 0.5);
+    else
+        refl = getSSR(NDC, wsNormal, 0.5);
+
+    // ---- TEMPORAL ACCUMULATION TEST ----
+    // Reproject current surface position into previous frame's screen space.
+    // mixPrevFrame logic adapted from waterReflection.hlsl.
+    float4 prevNDC = mul(NDC, gPrevFrameTransform);
+    prevNDC.xy /= prevNDC.w;
+    float2 puv = float2(prevNDC.x, -prevNDC.y) * 0.5 + 0.5;
+    float4 prevRefl = prevReflection.SampleLevel(
+        gTrilinearBlackBorderSampler, puv, 0);
+
+    // Disocclusion detection: if reprojected UV moved far in NDC space,
+    // the surface was likely occluded last frame. Reduce history weight.
+    float factor = saturate(1 - distance(prevNDC.xy, NDC.xy/NDC.w) * 10);
+
+    // Blend toward history. 0.85 is less aggressive than water's 0.9
+    // to keep model reflections more responsive to camera movement.
+    float w = 0.85 * saturate(prevRefl.w * factor);
+
+    // If prevReflection is unbound, prevRefl = (0,0,0,0), w = 0,
+    // and this returns the current frame's result unchanged.
+    refl.rgb = max(0, lerp(refl.rgb, prevRefl.rgb, w));
+    // ---- END TEMPORAL TEST ----
+
+    return refl;
 }
-
 
 #define COMMON_PART 		SetVertexShader(CompileShader(vs_5_0, VS()));	\
 							SetGeometryShader(NULL);						\

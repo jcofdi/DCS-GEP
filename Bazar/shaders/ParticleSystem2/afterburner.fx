@@ -4,6 +4,7 @@
 #include "common/ambientCube.hlsl"
 #include "common/softParticles.hlsl"
 #include "common/random.hlsl"
+#define DITHER_MODE_R2
 #include "common/dithering.hlsl"
 
 #define ATMOSPHERE_COLOR
@@ -34,10 +35,14 @@ float4x4	World;
 #define volumeBrightness	params3.z
 #define effectDistMax		params3.w
 
-static const float3	glowColor = float3(1, 0.7, 0.3);
+// V3: glowColor defined in linear space, approximating ~2000K blackbody.
+// Previous sRGB (1, 0.7, 0.3) squared to (1, 0.49, 0.09) in psGlow,
+// which was excessively red. This linear value is used directly without
+// squaring, producing a physically motivated warm amber.
+static const float3	glowColor = float3(1.0, 0.54, 0.16);
 
 static const int	maxSegments = 36; //modded: was 26 — more segments for smoother plume
-static const int	maxSegmentsHotAir = 18; //modded: was 8 — more segments for smoother shimmer
+static const int	maxSegmentsHotAir = 12; //modded: was 8 — more segments for smoother shimmer
 
 static const float	opacityFactor = 1.0f/maxSegments;
 static const float	opacityFactorHotAir = 1.0f/maxSegmentsHotAir;
@@ -111,8 +116,10 @@ VS_CIRCLE_OUTPUT vsCircle(uint vertId: SV_VertexId)
 // from context.hlsl (gSunDir, gSunAttenuation) and the World matrix.
 //
 // World._42 = aircraft altitude in DCS world-space (Y-up).
-// gSunDir.y = sun elevation: +1 overhead, 0 horizon, -1 midnight.
-// gSunAttenuation = ~0 at night/deep overcast, ~1 in full daylight.
+// gSunDir   = world-space sun direction (not gSunDirV which is view-space).
+//   .y = sine of solar elevation: +1 overhead, 0 horizon, -1 midnight.
+// gSunAttenuation = geometric atmospheric path-length extinction only.
+//   ~1.0 in clear daylight, ~0.0 at night. Not weather-dependent.
 // =============================================================================
 
 // Aircraft altitude in meters from World matrix Y-translation.
@@ -128,22 +135,9 @@ float getAtmosphericDensityFactor()
 	return saturate(exp(-getAircraftAltitude() / 8500.0));
 }
 
-// V2: GetAfterburnerAttenuation — reverted to stock behavior (return 1.0).
-//
-// The previous version applied day/night modulation here, but this is
-// already handled by the rendering pipeline: additive blending naturally
-// makes the flame more visible against a dark sky and less visible against
-// a bright sky. The previous implementation was double-applying the
-// perceptual adjustment, causing a ~17.5% daytime dimming that compounded
-// with other opacity reductions.
-//
-// The function signature is preserved because it's called from multiple
-// places (psAfterburner, gsCircle, psFLIR) and could be re-enabled later
-// with corrected values if needed.
-float GetAfterburnerAttenuation(float attPower = 1.0)
-{
-	return 1;
-}
+// V2/V3: GetAfterburnerAttenuation removed. Additive blending inherently
+// handles day/night contrast (emissive pops less against a bright sky).
+// All former call sites now use literal 1.0.
 
 // Dynamic heat shimmer power (modded: replaces static hotAirPower in hot-air paths).
 //
@@ -164,15 +158,10 @@ float getDynamicHotAirPower()
 	return hotAirPower * 0.7 * density * nightThermal;
 }
 
-// Glow halo modulator (modded).
-// The lens/corona glow is dramatically more perceptible at night and
-// at altitude where less atmosphere scatters the bloom outward.
-float getGlowModulator()
-{
-	float nightVisibility = 1.0 + 0.9 * saturate(-gSunDir.y);
-	float altitudeClarity = 1.0 + 0.2 * saturate(getAircraftAltitude() / 10000.0);
-	return nightVisibility * altitudeClarity;
-}
+// V3: getGlowModulator() removed. Its logic (night visibility + altitude
+// clarity) has been consolidated into vsGlow's nightGlowBoost to avoid
+// the double-boost that occurred when both VS and PS applied separate
+// night multipliers.
 
 // =============================================================================
 // END ATMOSPHERIC HELPERS
@@ -298,7 +287,7 @@ void gsCircle(point VS_CIRCLE_OUTPUT input[1], inout TriangleStream<GS_OUTPUT> o
 	
 	float t = getCircleParamStutter(uint((float)gsVertId+0.1f)*circleCountInv);
 
-	float att = GetAfterburnerAttenuation(0.5);
+	float att = 1.0;
 
 	float4 vPos = mul(mul(float4(0,0,0, 1), World), gView); vPos /= vPos.w;
 	o.dist = max(0, vPos.z) * 1.73 / gProj._11;
@@ -386,7 +375,7 @@ float4 psAfterburner(in GS_OUTPUT i, uniform bool bHotAir): SV_TARGET0
 		float noise = noiseTex.Sample(WrapLinearSampler, noiseUV).r;
 		emissive *= 1 + 10 * noise * saturate( i.UV.x - i.UV.x * pow(sin(i.UV.y*PI), 10) );
 		
-		return float4(emissive * (i.cldAlpha * psOpacity * 0.0112 * GetAfterburnerAttenuation(0.5)), 1);
+		return float4(emissive * (i.cldAlpha * psOpacity * 0.0112), 1);
 	}
 #else
 
@@ -405,7 +394,7 @@ float4 psAfterburner(in GS_OUTPUT i, uniform bool bHotAir): SV_TARGET0
 	{
 		float noiseMask = baseColor.a;
 		baseColor.a *= psOpacity * 0.45;
-		baseColor.a *= GetAfterburnerAttenuation(0.5);
+		// GetAfterburnerAttenuation removed in V3 (was returning 1.0)
 		
 		const uint nCircles = (uint)circleCount;
 		for(uint j=0; j<nCircles; ++j)
@@ -491,7 +480,7 @@ float4 psFLIR(in GS_OUTPUT i) : SV_TARGET0
 
 	float noiseMask = baseColor.a;
 	baseColor.a *= psOpacity * 0.45;
-	baseColor.a *= GetAfterburnerAttenuation(0.5);
+	// GetAfterburnerAttenuation removed in V3 (was returning 1.0)
 
 	baseColor.a = pow(baseColor.a, 3);
 
@@ -506,7 +495,11 @@ float4 psCircle(in GS_OUTPUT i, uniform bool bHotAir): SV_TARGET0
 		float4 p = mul(float4(0, 0, depth, 1), gProjInv);
 		float dist = min(1, p.z/(p.w*hotAirDistMax));
 		float alpha = max(0, 1 - dot(i.UV.xy, i.UV.xy));
-		return float4(1, dist, 1, min(alpha*2, 1) * hotAirPower * 0.8 * saturate(1 - (i.dist-hotAirDistOffset) * hotAirDistMaxInv));
+		// V3: match psAfterburner hot-air branch -- use dynamic power so
+		// circle-pass shimmer responds to altitude and time-of-day.
+		// The 0.8 scale on stock hotAirPower is dropped; getDynamicHotAirPower
+		// already produces a conservative base (~0.35 sea-level noon).
+		return float4(1, dist, 1, min(alpha*2, 1) * getDynamicHotAirPower() * saturate(1 - (i.dist-hotAirDistOffset) * hotAirDistMaxInv));
 	}
 	else
 	{
@@ -539,9 +532,13 @@ static const float4 quad2[4] = {
 PS_INPUT vsGlow(uint vertId:  SV_VertexID, uniform bool bFLIR = false)
 {
 	const float scale = bFLIR? 3.5 : 1.1;
-	// modded: night boost on glow opacity — dark sky makes the nozzle halo dramatically
-	// more visible. The 0.042 base is the default; we scale it up at night.
-	float nightGlowBoost = bFLIR? 1.0 : (1.0 + 0.5 * saturate(-gSunDir.y));
+	// V3: consolidated night + altitude glow boost here (VS, once per quad).
+	// Removed the separate getGlowModulator() call in psGlow to prevent
+	// double-boosting (was 1.5 * 1.9 = 2.85x at midnight, now just ~1.9x).
+	// Altitude clarity factor: reduced scatter at altitude lets more bloom
+	// reach the observer.
+	float altitudeClarity = 1.0 + 0.2 * saturate(getAircraftAltitude() / 10000.0);
+	float nightGlowBoost = bFLIR? 1.0 : (1.0 + 0.9 * saturate(-gSunDir.y)) * altitudeClarity;
 	const float glowOpacityMax = (bFLIR? 1 : 0.042 * nightGlowBoost) * opacityMax;
 	const float maxVisFactorDist = 700;
 
@@ -574,16 +571,14 @@ float4 psGlow(PS_INPUT i, uniform bool bClouds, uniform bool bFLIR = false): SV_
 	float alpha = max(0, glowTex.Sample(ClampLinearSampler, i.uv.xy).r - 0.01);
 	alpha *= alpha * i.uv.z;
 
-	// modded: apply night/altitude glow multiplier for non-FLIR views
-	// At night the orange halo is the most prominent visual; at altitude
-	// reduced scatter lets more bloom reach the observer.
-	if(!bFLIR)
-		alpha *= getGlowModulator();
+	// V3: night/altitude boost consolidated into vsGlow (per-quad, not per-pixel).
+	// getGlowModulator() removed here to eliminate double night-boost.
 
 	if(bClouds)
 		alpha *= getAtmosphereTransmittance(0).r;
 
-	return float4(glowColor * glowColor, alpha);
+	// V3: glowColor is now defined in linear space; no squaring needed.
+	return float4(glowColor, alpha);
 }
 
 

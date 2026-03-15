@@ -1,9 +1,8 @@
 #ifndef _HOT_AIR_COMMON_HLSL
 #define _HOT_AIR_COMMON_HLSL
 
-// Reduced from 150.0 to 80.0 metres to tighten the depth range over which
-// heat distortion renders. This prevents the effect bleeding into space
-// around the aircraft body and keeps it closer to the actual exhaust stream.
-static const float hotAirDistMax = 80.0;
+// V3: 100m balances the V2 tightening (prevent bleed around fuselage) with
+// enough depth headroom to avoid a hard shimmer cutoff. Stock was 150.
+static const float hotAirDistMax = 100.0;
 
 #endif

@@ -12,10 +12,47 @@
 #endif
 
 #include "deferred/environmentCube.hlsl"
+#include "common/dithering.hlsl"
 
 float modifyRoughnessByCloudShadow(float roughness, float cloudShadow)
 {
     return roughness;
+}
+
+// =============================================================================
+// Shadow-compensated AO: approximate missing local bounce illumination
+// =============================================================================
+//
+// In shadowed concavities (wing roots, intake ducts, underbelly), AO correctly
+// reduces IBL contribution based on reduced sky-hemisphere visibility. However,
+// in a real scene, nearby sunlit surfaces bounce significant diffuse energy into
+// these regions - energy the environment cubemap cannot capture because it
+// represents distant sky, not local geometry.
+//
+// Without GI, this bounce light is entirely absent. AO then over-penalizes the
+// only remaining light source (IBL), producing shadows darker than reference.
+//
+// Compensation: relax AO strength on IBL terms in proportion to how much the
+// surface is already in shadow. When shadow ≈ 0, reduce AO penalty by
+// BOUNCE_APPROX_STRENGTH fraction, approximating the bounce fill that would
+// have partially offset the reduced sky visibility.
+//
+// The shadow value reaching ShadeSolid is finalShadow = min(cascade, terrain,
+// sss, clouds), which is the correct combined signal - any shadow source
+// produces the same bounce-light deficit.
+//
+// Tuning:
+//   0.0 = disabled, AO always at full strength (stock behavior)
+//
+static const float BOUNCE_APPROX_STRENGTH = 0.10;
+
+float compensateAOForMissingBounce(float AO, float shadow)
+{
+	// Scale AO influence on IBL from full (sunlit) to reduced (shadowed).
+	// shadow = 1 → aoScale = 1.0  → effectiveAO = AO  (unchanged)
+	// shadow = 0 → aoScale = 0.65 → effectiveAO biased toward 1.0
+	float aoScale = lerp(1.0 - BOUNCE_APPROX_STRENGTH, 1.0, shadow);
+	return lerp(1.0, AO, aoScale);
 }
 
 float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1, 1), uniform uint selectEnvCube = LERP_ENV_MAP, float lerpEnvCubeFactor = 0, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), uniform bool insideCockpit = false)
@@ -24,6 +61,10 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 	float NoL = max(0, dot(normal, gSunDir));
 	float3 lightAmount = sunColor * (gSunIntensity * NoL * shadow);
 	float3 finalColor = ShadingDefault(diffuseColor, specularColor, roughnessSun, normal, viewDir, gSunDir, energyLobe) * lightAmount;
+
+	// Compensate AO on IBL terms for missing local bounce light.
+	// Only applied to the IBL multiplier — direct sun term above is unaffected.
+	float iblAO = compensateAOForMissingBounce(AO, shadow);
 
 	//diffuse IBL
 	float3 envLightDiffuse;
@@ -41,7 +82,7 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 	{
 		envLightDiffuse = SampleEnvironmentMap(eis, normal, 1.0, environmentMipsCount, selectEnvCube, lerpEnvCubeFactor);
 	}
-	finalColor += diffuseColor * envLightDiffuse * (gIBLIntensity * AO * energyLobe.x);
+	finalColor += diffuseColor * envLightDiffuse * (gIBLIntensity * iblAO * energyLobe.x);
 
 	//specular IBL
 	float NoV = max(0, dot(normal, viewDir));
@@ -87,9 +128,12 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 		// Fade reflections near screen edges to prevent hard cutoff when
 		// reflected geometry exits the viewport. The 8% border width
 		// produces a smooth fallback to the environment cubemap.
-		float2 edgeFade = smoothstep(0.0, 0.08, uvSSLR) * smoothstep(0.0, 0.08, 1.0 - uvSSLR);
+		float2 edgeFade = smoothstep(0.0, 0.04, uvSSLR) * smoothstep(0.0, 0.04, 1.0 - uvSSLR);
 		sslr.a *= edgeFade.x * edgeFade.y;
-
+		sslr.a *= smoothstep(0.0, 0.15, NoV);
+		// Stochastic softening at stencil boundary: ±0.05 dither on alpha
+		// breaks the hard edge where material transitions to non-reflective.
+		sslr.a = saturate(sslr.a + ditherCentered(uint2(uvSSLR * gSreenParams.xy)) * 0.05);
 		envLightSpecular = lerp(envLightSpecular, sslr.rgb, sslr.a);
 	}
 	}
@@ -103,7 +147,7 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 	// single-scattering GGX on rough metallic surfaces.
 	specColor *= SpecularEnergyCompensation(specularColor, roughness, NoV);
 
-	finalColor += envLightSpecular * specColor * (AO * energyLobe.y);
+	finalColor += envLightSpecular * specColor * (iblAO * energyLobe.y);
 
 	return finalColor;
 }

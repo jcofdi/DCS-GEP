@@ -255,7 +255,7 @@ graphics('visibRange')					:setValue('Low')	:combo({Name(_('LOW'))		:Value('Low'
 																	Name(_('HIGH'))		:Value('High'),
 																	Name(_('ULTRA'))	:Value('Ultra')		:OnlyArch64(),
 																	Name(_('EXTREME'))	:Value('Extreme')	:OnlyArch64(),
-																	Name(_('JC'))		:Value('JC')		:OnlyArch64(),
+																	Name(_('GEP'))		:Value('GEP')		:OnlyArch64(),
 																}):low('Low'):medium('Medium'):high('High'):VR('Medium')
 												
 graphics('heatBlr')						:setValue(0)		:combo({Name(_('OFF'))		:Value(0),

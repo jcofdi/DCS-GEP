@@ -12,20 +12,21 @@ Effect = {
 		ScaleBase = 1.3, --  meters
 				
 		DistMax = { -- distance between particles, m
-			-- Increased low-speed spacing to thin out the near-nozzle density
-			{(nozzleSpdMin+0)*kmh_to_ms,   14},
-			{(nozzleSpdMin+500)*kmh_to_ms,  4}
+			-- V3: 10m compromise (stock 8, V2 was 14). Enough density for
+			-- visible near-nozzle shimmer without the spherical pile-up.
+			{(nozzleSpdMin+0)*kmh_to_ms,   10},
+			{(nozzleSpdMin+500)*kmh_to_ms,  3}
 		},
 		LifeTime = { -- nozzle speed min + aircraft speed, time
-			-- Reduced low/mid-speed lifetimes to prevent particles lingering
-			-- around the nozzle and creating a halo effect
-			{(nozzleSpdMin+0)*kmh_to_ms,    1.2},
-			{(nozzleSpdMin+300)*kmh_to_ms,  0.7},
+			-- V3: 1.6s low-speed (stock 2.2, V2 was 1.2). Keeps at least
+			-- one active particle in the 5-20m zone at any given moment.
+			{(nozzleSpdMin+0)*kmh_to_ms,    1.6},
+			{(nozzleSpdMin+300)*kmh_to_ms,  0.9},
 			{(nozzleSpdMin+500)*kmh_to_ms,  0.4},
 			{(nozzleSpdMin+700)*kmh_to_ms, 0.06}
 		},
 		LifeTimeJitter = { -- result lifetime = LifeTime*(1-LifeTimeJitter)
-			-- Tightened jitter to reduce stray long-lived particles near nozzle
+			-- V3: 0.5 matches stock; 0.4 high-speed retained from V2.
 			{nozzleSpdMin*kmh_to_ms,       0.5},
 			{(nozzleSpdMin+500)*kmh_to_ms, 0.4}
 		},

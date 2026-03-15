@@ -6,7 +6,11 @@
  * https://github.com/MayaMaya4096/ARPC
  *
  * Replaces single-wavelength approximation coefficients with spectrally-integrated
- * values using CIE 1931 XYZ color matching functions converted to sRGB.
+ * values using CIE 2006 2-deg XYZ color matching functions (derived from
+ * Stockman & Sharpe LMS cone fundamentals) converted to sRGB. The CIE 2006
+ * observer corrects the known short-wavelength overestimate in the CIE 1931
+ * z-bar function, reducing blue-channel inflation from Rayleigh's lambda^-4
+ * scattering and producing more perceptually accurate sunset colors.
  * This corrects overly purple sunsets/sunrises common to Bruneton-based
  * atmosphere implementations.
  *
@@ -17,8 +21,8 @@
  *
  * Changes from stock DCS values:
  *   - Rayleigh scale height:    8.0 km      -> 8.69645 km  (ARPC fitted)
- *   - Rayleigh scattering RGB:  5.8/13.5/33.1 e-3 -> 6.605/12.345/29.413 e-3 km^-1
- *   - Ozone absorption RGB:     unchanged (already ARPC: 2.291/1.540/0.0 e-3 km^-1)
+ *   - Rayleigh scattering RGB:  5.8/13.5/33.1 e-3 -> 5.950/12.787/30.504 e-3 km^-1
+ *   - Ozone absorption RGB:     2.291/1.540/0.0 e-3 -> 2.361/1.485/0.0 e-3 km^-1
  *   - Ozone density profile:    peak 25km/hw 15km -> peak 22.35km/hw 17.83km (ARPC fitted)
  *   - scatteringToSingleMie:    recalculated for new Rayleigh/Mie ratio
  *
@@ -38,25 +42,25 @@ void applyARPCOverrides(inout AtmosphereParameters atmosphere)
 	atmosphere.rayleigh_scale_height = 8.69645;
 
 	// Scattering coefficients (m^-1 -> km^-1):
-	//   R: 6.60493183e-06 -> 6.60493183e-03
-	//   G: 1.23449188e-05 -> 1.23449188e-02
-	//   B: 2.94126230e-05 -> 2.94126230e-02
-	atmosphere.rayleigh_scattering = float3(6.60493183e-3, 1.23449188e-2, 2.94126230e-2);
+    //   R: 5.9501e-06 -> 5.9501e-03
+    //   G: 1.2787e-05 -> 1.2787e-02
+    //   B: 3.0504e-05 -> 3.0504e-02
+	atmosphere.rayleigh_scattering = float3(5.9501e-3, 1.2787e-2, 3.0504e-2);
 
 	// --- scatteringToSingleMie (recalculated for ARPC Rayleigh / engine Mie) ---
 	// Formula: (rayleigh.r / rayleigh.g, rayleigh.r / rayleigh.b) with mie.r / mie.r = 1
 	// With achromatic Mie: float3(1.0, rayleigh.r/rayleigh.g, rayleigh.r/rayleigh.b)
 	atmosphere.scatteringToSingleMie = float3(
-		1.0,
-		(6.60493183e-3 / 1.23449188e-2),  // = 0.53503
-		(6.60493183e-3 / 2.94126230e-2)   // = 0.22456
-	);
+        1.0,
+        (5.9501e-3 / 1.2787e-2),   // = 0.46533
+        (5.9501e-3 / 3.0504e-2)    // = 0.19506
+    );
 
-	// --- Ozone absorption extinction (ARPC spectrally-integrated) ---
-	// R: 2.29107232e-06 m^-1 -> 2.29107232e-03 km^-1
-	// G: 1.54036079e-06 m^-1 -> 1.54036079e-03 km^-1
-	// B: 0.0 m^-1             -> 0.0 km^-1
-	atmosphere.absorption_extinction = float3(2.29107232e-3, 1.54036079e-3, 0.0);
+	// --- Ozone absorption extinction (ARPC CIE 2006 spectrally-integrated) ---
+    // R: 2.3609e-06 m^-1 -> 2.3609e-03 km^-1
+    // G: 1.4851e-06 m^-1 -> 1.4851e-03 km^-1
+    // B: 0.0 m^-1         -> 0.0 km^-1
+	atmosphere.absorption_extinction = float3(2.3609e-3, 1.4851e-3, 0.0);
 
 	// --- Ozone density profile (ARPC fitted to U.S. Standard Atmosphere 1976) ---
 	// Layer base (peak):  22349.90 m   (stock was 25000.0 m)

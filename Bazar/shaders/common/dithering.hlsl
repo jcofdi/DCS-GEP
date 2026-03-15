@@ -450,7 +450,9 @@ float3 ditherAtmosphericHDR(float3 color, float2 pixelPos, float ditherAmplitude
 float3 ditherOutput8bit(float3 color, uint2 pixel)
 {
     float noise = ditherTriangular(pixel);
-    return color + noise * (0.5 / 255.0);
+    float lum = max(color.r, max(color.g, color.b));
+    float strength = lerp(0.25, 1.0, smoothstep(0.0, 0.12, lum));
+    return color + noise * (0.5 / 255.0) * strength;
 }
 
 float3 ditherOutput10bit(float3 color, uint2 pixel)

@@ -5,13 +5,14 @@
 #include "deferred/deferredCommon.hlsl"
 #include "deferred/colorGrading.hlsl"
 // #define PLOT_TONEMAP_FUNCION
-// #define PLOT_AVERAGE_LUMINANCE
+#define PLOT_AVERAGE_LUMINANCE
 // #define PLOT_HISTOGRAM
 // #define DRAW_FOCUS
 #include "deferred/toneMap.hlsl"
 #include "deferred/calcAvgLum.hlsl"
 #include "common/random.hlsl"
 #include "common/stencil.hlsl"
+#define DITHER_MODE_R2
 #include "common/dithering.hlsl"
 
 #include "deferred/Decoder.hlsl"
@@ -78,7 +79,12 @@ float3 ColorGrade(float3 sourceColor, uint2 uv)
 
 float3 LinearToScreenSpaceCustom(float3 color)
 {
-	return pow(abs(color), outputGammaInv);
+    // GEP: Fixed sRGB encoding - gamma slider now drives
+    // exposure instead. Using simple pow(1/2.2) rather than
+    // piecewise sRGB because the original function was already
+    // a pure power law, and this maintains identical behavior
+    // at the previous default of 2.2.
+    return pow(abs(color), 1.0 / 2.2);
 }
 
 float3 SampleSceneColor(float2 uv, uint idx, uniform uint pixelSize = 1)
@@ -123,38 +129,46 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 #endif
 
 	float3 bloom = bloomTexture.SampleLevel(gBilinearClampSampler, i.projPos.zw, 0).rgb;
-	float exposure = getLinearExposure(lum);
 
-	// --- GEP: Sub-linear perceptual exposure compensation ---
-	// The stock exposure (0.18 / avgLum) perfectly normalizes every scene
-	// to the same display brightness. Human vision does not do this — bright
-	// scenes appear brighter than dim ones even after adaptation.
+	// GEP: Stock exposure with sub-linear perceptual compensation.
 	//
-	// This applies a mild power-law correction so that high-luminance scenes
-	// (sunny day) receive slightly more exposure and low-luminance scenes
-	// (night, heavy weather) receive slightly less.
+	// Stock adaptation (0.18 / clampedAvgLum) normalizes every scene to
+	// the same display brightness. The sub-linear correction partially
+	// undoes this so bright scenes feel bright and dark scenes feel dark.
 	//
-	// The correction is applied HERE (not inside getLinearExposure) so that
-	// the bloom threshold path in bloom.fx is unaffected — bloom still sees
-	// the original exposure, preventing unwanted bloom increase on sunny days.
+	// The clamp overshoot correction compensates for scenes where true
+	// avgLum exceeds the engine's clamp range (0.010-0.600). It
+	// algebraically cancels the clamp, producing the equivalent of
+	// pow(0.18 / trueLum, exponent) regardless of clamp state.
 	//
-	// Tuning: gepExposureExponent controls the strength.
-	//   1.0  = no effect (stock behavior)
-	//   0.90 = mild (~15% brighter at high lum, ~15% darker at low lum)
-	//   0.85 = moderate
-	//   0.80 = strong (probably too much — test carefully)
-	//
-	// The neutral point where this has zero effect is when avgLum ≈ 0.18
-	// (the middle-gray key value). Above that, scenes get brighter; below, darker.
+	// gepExposureExponent controls the perceptual envelope:
+	//   1.0 = no effect (stock behavior)
+	//   0.80 = ~0.72 stops total swing from night to clear noon
+	float exposure = getLinearExposure(lum);
 	{
-		static const float gepExposureExponent = 0.80; // TUNE THIS
-		// Ratio: how far is the scene luminance from middle gray?
-		// At lum=0.18, ratio=1.0 and correction=1.0 (no change).
-		// At lum=2.0 (bright sun), ratio≈11, correction≈1.27 (+0.35 EV).
-		// At lum=0.01 (night), ratio≈0.056, correction≈0.75 (-0.4 EV).
-		float ratio = lum / 0.18;
+		static const float gepExposureExponent = 0.8;
+
+		float trueLum = max(getAverageLuminance(), 0.001);
+		float ratio = trueLum / 0.18;
 		float correction = pow(max(ratio, 0.001), 1.0 - gepExposureExponent);
-		exposure *= correction;
+		float clampOvershoot = lum / max(trueLum, 0.001);
+
+		exposure *= correction * clampOvershoot;
+	}
+
+	// --- GEP: User exposure bias (repurposed gamma slider) ---
+	// The engine passes 1/gammaSlider as outputGammaInv.
+	// Default slider = 2.2 -> outputGammaInv = 0.4545.
+	// We recover the slider, map linearly to an EV offset
+	// (2.2 -> 0 EV, center of range), and apply as a stop shift.
+	//
+	// Mapping:  slider 1.0 -> -1.2 EV (darker)
+	//           slider 2.2 ->  0.0 EV (no change)
+	//           slider 3.5 -> +1.3 EV (brighter)
+	{
+		float userGamma  = 1.0 / outputGammaInv;
+		float userEVBias = (userGamma - 2.2) * 2.0;
+		exposure *= exp2(userEVBias);
 	}
 
 	if(hwFactor>0)//TODO remove
@@ -168,11 +182,48 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 	}
 
 	
-	float3 linearColor = lerp(sceneColor, bloom, bloomLerpFactor) * exposure;
-	
-	if(whiteBalanceFactor>0)
+	// GEP: Additive bloom composite with Fraunhofer-inspired adaptive intensity.
+	//
+	// Additive bloom adds scattered light energy on top of the scene,
+	// matching the physical behavior of optical scatter.
+	//
+	// Fraunhofer adaptive intensity models the PSF energy distribution
+	// difference between bright and dark adaptation states:
+	//   Day (small pupil): wider PSF, more visible halos (1.3x)
+	//   Night (large pupil): tighter PSF, subdued glow (0.7x)
+	float trueLumBloom = max(getAverageLuminance(), 0.001);
+	float pupilBloomScale = lerp(0.7, 1.3, smoothstep(0.02, 0.15, trueLumBloom));
+	float bloomLum = dot(bloom, float3(0.2126, 0.7152, 0.0722));
+	float bloomDesatAmount = lerp(0.5, 0.0, smoothstep(0.02, 0.10, trueLumBloom));
+	float3 neutralBloom = lerp(bloom, bloomLum, bloomDesatAmount);
+
+	// GEP: Dither bloom to break pyramid upsample banding.
+	float bloomDither = ditherR2(i.pos.xy) - 0.5; // centered [-0.5, 0.5]
+	neutralBloom += bloomDither * 0.05 * bloomLum;
+
+	float3 linearColor = (sceneColor + neutralBloom * bloomLerpFactor * pupilBloomScale) * exposure;
+
+	// GEP: Purkinje effect (scotopic vision color shift).
+	// In low light, rod-dominated vision shifts perceived color toward
+	// blue-gray. The scene illuminant (moonlight) is physically warm,
+	// but human perception at scotopic levels is blue-biased and
+	// desaturated. Only applies to dim pixels; bright local sources
+	// (lights, cockpit, emissives) activate cone vision regardless
+	// of scene adaptation level.
 	{
-		linearColor /= lerp(1, AmbientWhitePoint, whiteBalanceFactor);
+		float purkinjeStrength = 1.0 - smoothstep(0.01, 0.08, trueLumBloom);
+		if (purkinjeStrength > 0)
+		{
+			float3 lumCoeff = float3(0.2125, 0.7154, 0.0721);
+			float pixelLum = dot(linearColor, lumCoeff);
+			float gray = pixelLum;
+			float3 scotopic = gray * float3(0.75, 0.85, 1.0);
+
+			float localCone = smoothstep(0.005, 0.05, pixelLum);
+			float effectAmount = purkinjeStrength * 0.7 * (1.0 - localCone);
+
+			linearColor = lerp(linearColor, scotopic, effectAmount);
+		}
 	}
 
 	if(flags & TONEMAP_FLAG_DIRT_EFFECT)
@@ -194,6 +245,11 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 
 	screenColor = LinearToScreenSpaceCustom(toneMap(linearColor, tonemapOperator));
 
+	// GEP: Output-side display clamp (GT7-style).
+	// The ICtCp path and curve process the full HDR range correctly.
+	// The display simply cannot show more than 1.0.
+	screenColor = min(screenColor, 1.0);
+
 	if(flags & TONEMAP_FLAG_CUSTOM_FILTER)
 	{
 		screenColor = BC(screenColor, brightnessContrast.x, brightnessContrast.y);
@@ -213,6 +269,71 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 
 	debugDraw(i.projPos.xy, uv, screenColor);
 	
+	// DEBUG: Raw HDR and exposed luminance at screen center
+	// Point center of screen at any surface to read its values.
+	// Remove before release.
+/*	{
+		float2 px = i.pos.xy;
+		float3 centerScene = SampleSceneColor(gSreenParams.xy * 0.5, 0);
+		float rawLum = dot(centerScene, float3(0.2125, 0.7154, 0.0721));
+		float exposedLum = rawLum * exposure;
+
+		// Raw HDR luminance (top, what the scene actually contains)
+		float2 numPos1 = float2(px.x - 10.0, 100.0 - px.y);
+		plotNumber(numPos1, rawLum, screenColor);
+
+		// Exposed luminance (below, what the curve receives)
+		float2 numPos2 = float2(px.x - 10.0, 175.0 - px.y);
+		plotNumber(numPos2, exposure, screenColor);
+		
+		// Low Light luminance 
+		float2 numPos3 = float2(px.x - 10.0, 250.0 - px.y);
+		plotNumber(numPos3, rawLum * 10000.0, screenColor);		
+
+		// Average Raw luminance
+		float2 numPos4 = float2(px.x - 10.0, 325.0 - px.y);
+		plotNumber(numPos4, getAverageLuminance(), screenColor);
+
+		// Average Clamped Luminance
+		float2 numPos5 = float2(px.x - 10.0, 400.0 - px.y);
+		plotNumber(numPos5, getAvgLuminanceClamped(), screenColor);
+			
+		// Sun Direction
+		float2 numPos6 = float2(px.x - 10.0, 475.0 - px.y);
+		plotNumber(numPos6, gSunDir.y, screenColor);
+			
+		// Sun Attenuation
+		float2 numPos12 = float2(px.x - 10.0, 550.0 - px.y);
+		plotNumber(numPos12, gSunAttenuation, screenColor);
+			
+		// Cloudiness
+		float2 numPos7 = float2(px.x - 10.0, 625.0 - px.y);
+		plotNumber(numPos7, gCloudiness, screenColor);
+			
+		// Sun Diffuse
+		// float2 numPos8 = float2(px.x - 10.0, 700.0 - px.y);
+		// plotNumber(numPos8, gSunDiffuse.rgb, screenColor);
+			
+		// Sun R
+		// float2 numPos9 = float2(px.x - 10.0, 775.0 - px.y);
+		// plotNumber(numPos9, gSunDiffuse.r, screenColor);
+			
+		// Sun G
+		// float2 numPos10 = float2(px.x - 10.0, 850.0 - px.y);
+		// plotNumber(numPos10, gSunDiffuse.g, screenColor);
+			
+		// Sun B
+		// float2 numPos11 = float2(px.x - 10.0, 925.0 - px.y);
+		// plotNumber(numPos11, gSunDiffuse.b, screenColor);
+			
+		//plotNumber(numPos, whiteBalanceFactor, screenColor);
+		// And for the white point RGB:
+		//plotNumber(numPos, AmbientWhitePoint.r, screenColor);
+		//plotNumber(numPos, AmbientWhitePoint.g, screenColor);
+		//plotNumber(numPos, AmbientWhitePoint.b, screenColor);
+	}
+*/
+
 #ifdef DRAW_FOCUS
 	return calcGaussianWeight(length(i.projPos.xy*2-1) * focusWidth, focusSigma);
 #endif

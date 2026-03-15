@@ -53,7 +53,7 @@ float depthScaler = 6.0;
 float WaveLength = 30.0;
 float DXZScaler = 0.4;
 float DepthLevel = 30.0;
-float MaxWaveDist = 1500.0;
+float MaxWaveDist = 5000.0;
 float WaveScaler = 1.2;
 
 float foamMagn = 1.0;
@@ -102,7 +102,7 @@ float3 sample_position(float3 wPos, float2 scale) {
 }
 
 float2 sample_depth(float3 wPos, float scaler) {
-	float origDepth = ocean::SeaDepth.SampleLevel(ClampSampler, wPosToUV(wPos, ocean::shelfMatrix), 0).r;
+	float origDepth = ocean::SeaDepth.SampleBias(ClampSampler, wPosToUV(wPos, ocean::shelfMatrix), 0).r;
 
 	origDepth = saturate(0 - origDepth / DepthLevel);
 	float depth = pow(1.0 - origDepth, scaler);
@@ -120,7 +120,7 @@ WaveData sample_wave(float3 wPos, float XZscaler, float waveL) {
 
 	float2 sUV = wPosToUV(wPos, ocean::ViewProj);
 
-	float4 dXZ = irendercontext::WaveMap.SampleLevel(ClampSampler, sUV, 0);
+	float4 dXZ = irendercontext::WaveMap.SampleBias(ClampSampler, sUV, 0);
 	dXZ.xy = DXZScaler * clamp(dXZ.xy * 2.0 - 1.0, -1.0, 1.0);
 	float wL = length(dXZ.xy);
 
@@ -271,7 +271,7 @@ float3 calcWaterColor(float3 wPos, float waterDepth, float3 N, float2 reflection
 	// mipBias stays at 0 (full detail); beyond that it grows logarithmically.
 	// Prevents bump aliasing that causes vertical streaks when combined with
 	// physically-correct Fresnel (which no longer dampens grazing-angle reflections).
-	float mipBias = clamp(log2(max(1.0, L / 10.0)), 0.0, 7.0);
+	float mipBias = saturate(L / 5000.0) * 2.0;
 
 	float4 tmp = mul(float4(wPos, 1.0), ocean::HeightMatrix);
 	tmp = 0.5f * tmp + 0.5f;
@@ -279,19 +279,19 @@ float3 calcWaterColor(float3 wPos, float waterDepth, float3 N, float2 reflection
 	
 	float2 bumpOffset = N.xz / 20.0;
 
-	float3 bump = ocean::BumpMap.SampleLevel(WrapSampler, worldPos.xz / 15.0 + bumpOffset, mipBias) +
-		ocean::BumpMap.SampleLevel(WrapSampler, worldPos.xz / 10.0 + bumpOffset, mipBias) +
-		ocean::BumpMap.SampleLevel(WrapSampler, worldPos.xz / 20.0 + bumpOffset, mipBias);
+	float3 bump = ocean::BumpMap.SampleBias(WrapSampler, worldPos.xz / 15.0 + bumpOffset, mipBias) +
+		ocean::BumpMap.SampleBias(WrapSampler, worldPos.xz / 10.0 + bumpOffset, mipBias) +
+		ocean::BumpMap.SampleBias(WrapSampler, worldPos.xz / 20.0 + bumpOffset, mipBias);
 
 	N.xz = N.xz + 0.6 * normalize((bump / 3.0 - 0.5) * 2.0).xz;
 
-	bump = ocean::BumpMap.SampleLevel(WrapSampler, worldPos.xz / 5.0 + bumpOffset, mipBias);
+	bump = ocean::BumpMap.SampleBias(WrapSampler, worldPos.xz / 5.0 + bumpOffset, mipBias);
 	N.xz = N.xz * 0.8 + normalize((bump - 0.5) * 2.0).xz * 0.2 * ocean::windFactor;
 
 	N = normalize(N);
 
-	float3 hBump = (ocean::BumpMap.SampleLevel(WrapSampler, (worldPos.xz + ocean::windOffset) / 170.0, mipBias) +
-		ocean::BumpMap.SampleLevel(WrapSampler, (worldPos.xz + ocean::windOffset) / 1111.0, mipBias))*0.5;
+	float3 hBump = (ocean::BumpMap.SampleBias(WrapSampler, (worldPos.xz + ocean::windOffset) / 170.0, mipBias) +
+		ocean::BumpMap.SampleBias(WrapSampler, (worldPos.xz + ocean::windOffset) / 1111.0, mipBias))*0.5;
 
 	N = normalize(N + normalize((hBump - 0.5) * 2.0) * (0.25 + ocean::windFactor));
 

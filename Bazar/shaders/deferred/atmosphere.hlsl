@@ -83,6 +83,11 @@ EnvironmentIrradianceSample SampleEnvironmentIrradianceApprox(float3 pos, float 
 	float desatAmount = cloudOcclusion * (0.5 + 0.5 * cloudOcclusion);
 	o.skyIrradiance = lerp(o.skyIrradiance, dot(o.skyIrradiance, 0.33333), desatAmount);
 
+	// Cloud base diffuse fill - cloud occlusion isn't dark,
+	// it transmits diffuse light. No thickness variable so have to tune.
+	float cloudBaseFill = (1.0 - cloudsAO) * 0.75;
+	o.skyIrradiance *= (1.0 + cloudBaseFill);
+
 	//takes sand storm color into account depending on eye altitude and dust density
 	bool bSandStorm = gFogParams.color.r != gFogParams.color.b;
 	if(bSandStorm)
@@ -122,23 +127,52 @@ EnvironmentIrradianceSample SampleEnvironmentIrradianceApprox(float3 pos, float 
 // [ORIGINAL] Two-pole blend only:
 //   return lerp(eis.surfaceIrradiance, eis.skyIrradiance, saturate(y*0.5+0.5))
 //        + float3(1e-3, 1e-4, 1e-5)*ny;
+// [MOD] FIX #7b -- Directional horizon irradiance from ambient cube.
+//
+// FIX #7 used AmbientAverageHorizon (mean of four side walls), which
+// restored brightness for horizontal normals but lost the directional
+// gradient between sun-facing and opposite horizons. This revision
+// samples the four individual side walls weighted by the horizontal
+// component of the surface normal, preserving the brightness gradient
+// that physically exists in the sky hemisphere.
+//
+// Uses the same nSquared weighting as AmbientLight() in AmbientCube.hlsl
+// but restricted to the horizontal axes (X and Z). Cost over FIX #7:
+// one normalize and two multiply-adds -- essentially free.
 float3 SampleEnvironmentMapApprox(EnvironmentIrradianceSample eis, float3 normal, float roughness = 1.0)
 {
 	const float ny = dot(gSurfaceNormal, normal);
 	const float y = ny * 10 - 9 * (1 - roughness * roughness);
 	float t = saturate(y * 0.5 + 0.5);
 
-	// Existing two-pole vertical blend (up = skyIrradiance, down = surfaceIrradiance)
+	// Two-pole vertical blend (up = skyIrradiance, down = surfaceIrradiance)
 	float3 verticalIrradiance = lerp(eis.surfaceIrradiance, eis.skyIrradiance, t);
 
-	// Horizon contribution from actual ambient cube — strongest for horizontal normals.
-	// AmbientAverageHorizon is the average of the 4 side walls (+X, -X, +Z, -Z),
-	// already computed each frame in BuildAmbientCube and stored in AmbientMap[6].rgb.
-	// It naturally contains the correct brightness: bright on partially cloudy days
-	// (distant sunlit atmosphere), dim under overcast (rendered cubemap sees grey sky).
-	float horizonWeight = 1.0 - abs(ny);   // peaks at horizontal, zero at up/down
-	horizonWeight *= horizonWeight;          // sharpen falloff toward poles
-	float3 horizonIrradiance = AmbientAverageHorizon;
+	// Directional horizon irradiance from individual ambient cube side walls.
+	// Project the world-space normal onto the four horizontal faces.
+	// AmbientMap layout: [0]=+X, [1]=-X, [2]=+Y, [3]=-Y, [4]=+Z, [5]=-Z
+	float3 hNormal = float3(normal.x, 0, normal.z);
+	float hLen = length(hNormal);
+
+	float3 horizonIrradiance;
+	if (hLen > 0.001)
+	{
+		hNormal /= hLen;
+		float2 nSq = hNormal.xz * hNormal.xz;
+		uint2 isNeg = (hNormal.xz < 0.0);
+
+		horizonIrradiance = nSq.x * AmbientMap[isNeg.x].rgb
+		                  + nSq.y * AmbientMap[isNeg.y + 4].rgb;
+	}
+	else
+	{
+		// Pure vertical normal -- no horizontal preference, use average
+		horizonIrradiance = AmbientAverageHorizon;
+	}
+
+	// Horizon weight: peaks for horizontal normals, zero for up/down
+	float horizonWeight = 1.0 - abs(ny);
+	horizonWeight *= horizonWeight;
 
 	return lerp(verticalIrradiance, horizonIrradiance, horizonWeight * 0.5)
 		 + float3(1e-3, 1e-4, 1e-5) * ny;
@@ -168,6 +202,19 @@ float3 atmApplyLinearDithered(float3 v, float distance, float3 color, float2 pix
 	float inscatterMultiplier = lerp(INSCATTER_STRENGTH, 1.0, altitudeFactor);
 	// ========== END INSCATTER REDUCTION ==========
 	
+	// [MOD] Cloud-aware inscatter correction.
+	// Under overcast, the cloud layer filters the solar contribution to
+	// the atmospheric column below it. Inscatter becomes spectrally
+	// neutral (gray) and reduced in intensity. gCloudiness: 0 = clear,
+	// 1 = full overcast. Delayed onset via smoothstep preserves correct
+	// warm haze on scattered days; rapid transition through broken-to-
+	// overcast matches the physical threshold where cloud diffusion
+	// dominates the sub-cloud light field.
+	float cloudFactor = smoothstep(0.4, 0.9, gCloudiness);
+	float3 neutralInscatter = dot(inscatterColor, float3(0.2126, 0.7152, 0.0722));
+	inscatterColor = lerp(inscatterColor, neutralInscatter, cloudFactor * 0.7);
+	inscatterColor *= 1.0 - cloudFactor * 0.6;
+
 	float3 result = color * transmittance + inscatterColor * (gAtmIntensity * inscatterMultiplier);
 	
 	// ========== PRE-TONEMAP ATMOSPHERIC DITHERING ==========
@@ -204,6 +251,12 @@ float3 atmApplyLinear(float3 v, float distance, float3 color)
 	float inscatterMultiplier = lerp(INSCATTER_STRENGTH, 1.0, altitudeFactor);
 	// ========== END INSCATTER REDUCTION ==========
 	
+	// [MOD] Cloud-aware inscatter correction (see atmApplyLinearDithered).
+	float cloudFactor = smoothstep(0.4, 0.9, gCloudiness);
+	float3 neutralInscatter = dot(inscatterColor, float3(0.2126, 0.7152, 0.0722));
+	inscatterColor = lerp(inscatterColor, neutralInscatter, cloudFactor * 0.7);
+	inscatterColor *= 1.0 - cloudFactor * 0.6;
+
 	return color * transmittance + inscatterColor * (gAtmIntensity * inscatterMultiplier);
 }
 
