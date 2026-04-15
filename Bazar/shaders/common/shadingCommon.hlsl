@@ -14,6 +14,34 @@
 	#define CALCULATE_ENV_BRDF 0
 #endif
 
+// =============================================================================
+// Frostbite renormalized Disney diffuse (Lagarde, SIGGRAPH 2014, S3.1.3)
+// =============================================================================
+//
+// Based on the Burley/Disney diffuse model with energy renormalization.
+// The original Disney diffuse is not energy conserving -- hemispherical
+// reflectance exceeds 1.0 at high roughness. The energyBias and
+// energyFactor terms correct this while preserving the retro-reflective
+// brightening at grazing angles that gives rough surfaces their
+// characteristic appearance.
+//
+// Validated against the MERL measured BRDF database. Designed for the
+// Disney metallic/roughness parameterization that DCS uses.
+//
+// Reference:
+//   Lagarde, de Rousiers. "Moving Frostbite to Physically Based Rendering."
+//     SIGGRAPH 2014 PBS Course, Listing 1.
+// =============================================================================
+float Diffuse_Frostbite(float NdotV, float NdotL, float LdotH, float roughness)
+{
+    float energyBias = lerp(0, 0.5, roughness);
+    float energyFactor = lerp(1.0, 1.0 / 1.51, roughness);
+    float fd90 = energyBias + 2.0 * LdotH * LdotH * roughness;
+    float lightScatter = 1.0 + (fd90 - 1.0) * pow(1.0 - NdotL, 5);
+    float viewScatter  = 1.0 + (fd90 - 1.0) * pow(1.0 - NdotV, 5);
+    return lightScatter * viewScatter * energyFactor;
+}
+
 float3 ShadingSimple(float3 diffuseColor, float3 specularColor, float roughness, float3 normal, float3 viewDir, float3 lightDir, float2 energyLobe = float2(1,1))
 {
 	float3 H = normalize(lightDir + viewDir);
@@ -32,7 +60,9 @@ float3 ShadingDefault(float3 diffuseColor, float3 specularColor, float roughness
 	float NoL = max(0, dot(normal, lightDir));
 	float VoH = max(0, dot(viewDir, H));
 
-	float3 diffuse = Diffuse_lambert(diffuseColor);
+	float LdotH = max(0, dot(lightDir, H));
+	float Fd = Diffuse_Frostbite(NoV, NoL, LdotH, roughness);
+	float3 diffuse = diffuseColor * Fd * (1.0 / 3.1415926535897932);
 
 	float3 brdf = Fresnel_schlick(specularColor, VoH) * ( D_ggx(roughness, NoH) * Visibility_smithJA(roughness, NoV, NoL) );
 	// float brdf = D_ggx(roughness, NoH) * Fresnel_schlick(specularColor, VoH) * Visibility_implicit();

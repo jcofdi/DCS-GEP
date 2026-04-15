@@ -133,7 +133,9 @@ static const float BILATERAL_SENSITIVITY = 5e7;
 
 float4 filterMip(float2 uv, float radius, uniform uint count) {
 
-	static const float incr = 3.1415926535897932384626433832795 *(3.0 - sqrt(5.0));
+	// Vogel disk: uniform area coverage replaces stock quadratic spiral
+	// which concentrated ~75% of taps in the inner 25% of disc area.
+	static const float GOLDEN_ANGLE = 2.39996323;
 
 	// Depth-aware bilateral filtering (Wronski / Guerrilla GDC 2014):
 	// Read center pixel depth to reject spiral samples that cross depth
@@ -160,11 +162,11 @@ float4 filterMip(float2 uv, float radius, uniform uint count) {
 
 	[unroll(count)]
 	for (uint i = 0; i < count; ++i) {
-		offset += offs;
-		angle += incr;
+		float vogelR = sqrt((float(i) + 0.5) / float(count));
+		float theta  = float(i) * GOLDEN_ANGLE;
 		float s, c;
-		sincos(angle, s, c);
-		float2 delta = float2(c, s) * (offset * offset * radius);
+		sincos(theta, s, c);
+		float2 delta = float2(c, s) * (vogelR * radius);
 		float4 col = sourceTex.SampleLevel(ClampLinearSampler, uv + delta, 0);
 
 		// Bilateral weight: Gaussian falloff on raw depth difference.

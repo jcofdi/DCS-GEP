@@ -65,49 +65,132 @@ float terrainShadows(float4 pos) {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// [MOD] Secondary shadow map (spotlight) PCF replacement
+// [MOD] Secondary shadow map (spotlight) PCF + PCSS -- v4
 //
+// v1-v3: PCF replacement for stock single-tap spotlight shadows.
+//        Fixed stair-stepping, shadow acne, matched cascade bias model,
+//        screen-space noise for spiral rotation.
 //
+// v4: Adds depth-ratio PCSS for physically-based penumbra softening.
+//
+//   Spotlights use perspective projection, so shadow-space depth is
+//   proportional to 1/distance_from_light.  The ratio of blocker depth
+//   to receiver depth directly encodes the geometric penumbra factor:
+//
+//     penumbraRatio = blockerDepth / receiverDepth - 1.0
+//
+//   This requires no inverse matrix, no light position, no shadow map
+//   resolution -- just two depth values.  Multiply by a constant
+//   representing the light source's angular size in shadow UV space
+//   and you have the penumbra width.
+//
+//   Contact shadows (ratio near zero) stay razor sharp.  Shadows far
+//   from their caster produce physically wider penumbrae.
+//
+//   The max clean radius is derived from the tap count, same as cascade
+//   PCSS: maxR_UV = sqrt(taps * 4 / pi) / estimatedResolution.
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Number of PCF taps for spotlight shadows.
-// 8 gives excellent quality at negligible cost.  4 is a cheaper fallback
-// if profiling shows pressure; 12–16 for ultra-smooth penumbrae.
-#define SECONDARY_SSM_SAMPLES 16
+// Master toggle for spotlight PCSS.  Set to 0 for fixed-radius PCF only.
+#define SPOT_PCSS_ENABLE 1
 
-// Filter radius in shadow UV space.  This is the approximate size of
-// 1.5 texels at 1024² resolution (1.5/1024 ≈ 0.00146).  If the engine
-// uses a different resolution, adjust proportionally:
-//    512  → 0.0029
-//   1024  → 0.00146  (default)
-//   2048  → 0.00073
-// The value is intentionally slightly larger than 1-texel to dissolve
-// stair-steps without visibly softening contact shadows.
-#define SECONDARY_SSM_FILTER_RADIUS 0.00050
+// Number of PCF taps for spotlight shadows.
+#define SECONDARY_SSM_SAMPLES 8
+
+// Minimum PCF filter radius in shadow UV space.  This is the fixed-radius
+// floor -- the smallest the filter can be, regardless of PCSS.
+// At 2048 resolution, 0.00055 is approx 1.1 texels.  Dissolves stair-
+// stepping at contact without over-softening.
+#define SECONDARY_SSM_FILTER_RADIUS 0.00055
+
+// Base depth bias and per-tap escalation, matching cascade conventions.
+#define SECONDARY_SSM_BIAS 0.0008
+#define SECONDARY_SSM_BIAS_SLOPE 3.0
+
+// ── PCSS parameters ─────────────────────────────────────────────────────
+
+// Light source angular size in shadow UV space.  Controls how quickly
+// penumbrae grow with blocker-to-receiver separation.
+//
+// Physically, a 30cm deck flood at 10m subtends ~0.03 rad.  In the
+// spotlight's shadow projection, this maps to a fraction of the UV
+// range depending on the spot's FOV.  A spot with 90-degree FOV maps
+// ~1.57 rad to [0,1] UV, so 0.03 rad ≈ 0.019 UV.
+//
+// Tuning: increase for softer penumbrae (larger apparent light source),
+// decrease for harder shadows (smaller point-like source).
+// 0.02 is a reasonable physical starting point for carrier deck floods.
+#define SPOT_PCSS_LIGHT_SIZE 0.02
+
+// Estimated secondary shadow map resolution.  Used only to compute the
+// max clean PCF radius from tap count.  Empirically confirmed at 2048.
+#define SPOT_PCSS_MAP_SIZE 2048.0
+
+// Minimum depth ratio below which PCSS is skipped.  Prevents depth
+// quantization noise from triggering false penumbrae on flat surfaces.
+#define SPOT_PCSS_MIN_RATIO 0.002
+
+
+// Screen-space noise for per-pixel spiral rotation, matching
+// SampleShadowMap in shadows.hlsl.
+float secondarySSM_rnd(float2 xy) {
+	return frac(sin(dot(xy, float2(12.9898, 78.233))) * 43758.5453);
+}
 
 float secondarySSM(float4 pos, uniform uint idx) {
 
 	float4 shadowPos = mul(pos, gSecondaryShadowmapMatrix[idx]);
 	float3 shadowCoord = shadowPos.xyz / shadowPos.w;
 
-	float bias = 0.00015;
-	float refDepth = saturate(shadowCoord.z) + bias;
+	// ── Per-pixel rotation via screen-space hash ────────────────────
+	float4 clipPos = mul(float4(pos.xyz, 1.0), gViewProj);
+	float noise = secondarySSM_rnd(clipPos.xy / clipPos.w);
 
-	// ── Per-pixel noise from world position ─────────────────────────
-	// We need a per-pixel value to rotate the sample disk so adjacent
-	// pixels don't share the same tap pattern.  Screen-space derivatives
-	// (ddx/ddy) are FORBIDDEN here because this function is called
-	// inside a dynamic loop in CalculateDynamicLightingTiled().
+	// ── PCSS: depth-ratio blocker search ────────────────────────────
+	// Maximum clean radius from tap count (UV space).
+	// sqrt(taps * 4 / pi) gives texels; divide by resolution for UV.
+	static const float PI_VAL = 3.14159265;
+	static const float maxCleanUV = sqrt((float)SECONDARY_SSM_SAMPLES * 4.0 / PI_VAL)
+		/ SPOT_PCSS_MAP_SIZE;
+
+	float filterRadius = SECONDARY_SSM_FILTER_RADIUS;
+
+#if SPOT_PCSS_ENABLE
+	// Read raw (non-compared) depth at the receiver's shadow coordinate.
+	// This texel was just comparison-sampled on the first PCF tap's
+	// location, so it is sitting in L1 cache.
+	float blockerDepth = secondaryShadowMap.SampleLevel(
+		gPointClampSampler,
+		float3(shadowCoord.xy, idx), 0).x;
+
+	float receiverDepth = shadowCoord.z;
+
+	// DCS uses reversed-Z: larger depth = closer to light.
+	// A blocker closer to the light has blockerDepth > receiverDepth.
 	//
-	// Instead we hash the shadow UV coordinates, which are unique per
-	// pixel and per light.  This is cheap (two frac + dot) and produces
-	// good spatial distribution.  TAA further smooths any residual noise.
-	float noise = frac(52.9829189 * frac(dot(shadowCoord.xy, float2(443.8975, 397.2973))));
+	// In reversed-Z perspective: depth ~ near / distance
+	//   dist_blocker ~ 1 / blockerDepth
+	//   dist_receiver ~ 1 / receiverDepth
+	//   penumbraRatio = (dist_receiver - dist_blocker) / dist_blocker
+	//                 = blockerDepth / receiverDepth - 1
+	//
+	// Positive when a blocker exists, zero at contact, grows with
+	// blocker-to-receiver separation.  No inverse matrix needed.
+	float depthRatio = blockerDepth / receiverDepth - 1.0;
+
+	if (depthRatio > SPOT_PCSS_MIN_RATIO)
+	{
+		float penumbraUV = depthRatio * SPOT_PCSS_LIGHT_SIZE;
+
+		// Clamp between floor (fixed PCF radius) and ceiling (what
+		// the tap count can fill cleanly without dithering).
+		filterRadius = clamp(penumbraUV, SECONDARY_SSM_FILTER_RADIUS, maxCleanUV);
+	}
+#endif // SPOT_PCSS_ENABLE
 
 	// ── Golden-angle spiral PCF ─────────────────────────────────────
-	static const float PI2 = 6.28318530;
-	static const float goldenAngle = 2.39996323;  // π(3−√5)
-	float angle = noise * PI2;
+	static const float goldenAngle = 2.39996323;  // pi * (3 - sqrt(5))
+	float angle = noise;
 	static const float invSamples = 1.0 / (float)SECONDARY_SSM_SAMPLES;
 	float spiralOffset = invSamples * 0.5 + noise * invSamples;
 
@@ -119,14 +202,21 @@ float secondarySSM(float4 pos, uniform uint idx) {
 		float s, c;
 		sincos(angle, s, c);
 
-		// sqrt() converts uniform radial to uniform area distribution.
-		float r = sqrt(spiralOffset) * SECONDARY_SSM_FILTER_RADIUS;
+		float r = sqrt(spiralOffset) * filterRadius;
 		float2 offset = float2(c, s) * r;
+
+		// Per-tap escalating bias scales with the actual filter radius.
+		// Wider penumbrae span more depth variation and need more bias.
+		// Convert filterRadius from UV to approximate texel count for
+		// bias scaling (same convention as cascade PCF).
+		float tapBiasScale = filterRadius * SPOT_PCSS_MAP_SIZE;
+		float tapBias = SECONDARY_SSM_BIAS
+			* (1.0 + tapBiasScale * spiralOffset);
 
 		acc += secondaryShadowMap.SampleCmpLevelZero(
 			gCascadeShadowSampler,
 			float3(shadowCoord.xy + offset, idx),
-			refDepth);
+			saturate(shadowCoord.z) + tapBias);
 
 		angle += goldenAngle;
 		spiralOffset += invSamples;

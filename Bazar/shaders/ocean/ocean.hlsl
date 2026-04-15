@@ -134,10 +134,21 @@ WaveData sample_wave(float3 wPos, float XZscaler, float waveL) {
 	wave.xz = K / k * Axz * sin(D * k + w * ocean::time);
 	wave.y = -Ay * cos(D * k + w * ocean::time) * sign(length(K));
 
+	// [MOD] Wind-dependent vertical amplitude. Stock crushed all waves to 30%
+	// height regardless of conditions. Real wave steepness increases with wind
+	// speed: calm seas have gentle slopes, heavy weather produces steep faces
+	// approaching the breaking limit (~1:7 height-to-wavelength).
+	//
+	// At windFactor 0 (calm): vertScale = 0.35 (gentle, similar to stock)
+	// At windFactor 1 (max):  vertScale = 0.80 (steep, approaching breaking)
+	//
+	// The 0.80 ceiling preserves margin before mesh self-intersection artifacts
+	// that would occur if vertical displacement exceeded horizontal wavelength
+	// spacing on the ocean grid.
 	WaveData o;
-	wave.y *= 0.3;
-	wave.xz *= 0.9;
-	o.wave = wave.xyz;
+	float vertScale = lerp(0.35, 0.80, saturate(ocean::windFactor));
+	wave.y *= vertScale;
+	wave.xz *= 0.9;	o.wave = wave.xyz;
 	o.wL = wL;
 	o.wW = dXZ.w;
 
@@ -161,7 +172,14 @@ float4 getPosition(float3 wPos) {
 
 	float wScaler = lerp(WaveScaler, 1.0, saturate(depth.x));
 
-	float3 W = -wScaler * wave.wave * wave.wL / DXZScaler * ocean::windFactor;
+	// [MOD] Overcast swell boost. Cloud cover correlates with sustained
+	// low-pressure systems that produce longer fetch and more developed seas.
+	// A 20% boost under full overcast is a modest heuristic; real swell
+	// development depends on fetch, duration, and storm track geometry, none
+	// of which DCS models. This simply ensures overcast ocean scenes feel
+	// appropriately heavier than clear-sky days at the same wind speed.
+	float swellBoost = 1.0 + 0.2 * gCloudiness;
+	float3 W = -wScaler * wave.wave * wave.wL / DXZScaler * ocean::windFactor * swellBoost;
 	ret += W;
 
 	return float4(ret, W.y);
@@ -293,7 +311,13 @@ float3 calcWaterColor(float3 wPos, float waterDepth, float3 N, float2 reflection
 	float3 hBump = (ocean::BumpMap.SampleBias(WrapSampler, (worldPos.xz + ocean::windOffset) / 170.0, mipBias) +
 		ocean::BumpMap.SampleBias(WrapSampler, (worldPos.xz + ocean::windOffset) / 1111.0, mipBias))*0.5;
 
-	N = normalize(N + normalize((hBump - 0.5) * 2.0) * (0.25 + ocean::windFactor));
+	// [MOD] Wind-scaled fine-detail bump normals. The /5 scale bump provides
+	// the most visible micro-roughness. In calm conditions this should be
+	// subtle; in heavy weather it should be pronounced, matching the increased
+	// capillary wave activity that wind produces on real water.
+	float fineDetailWind = lerp(0.12, 0.25, saturate(ocean::windFactor));
+	bump = ocean::BumpMap.SampleBias(WrapSampler, worldPos.xz / 5.0 + bumpOffset, mipBias);
+	N.xz = N.xz * 0.8 + normalize((bump - 0.5) * 2.0).xz * fineDetailWind * ocean::windFactor;
 
 	NdotL = max(dot(N, ocean::light), 0.0);
 	float3 R = reflect(normalize(-ocean::camera.xyz + wPos.xyz), N);
@@ -356,6 +380,16 @@ float3 calcWaterColor(float3 wPos, float waterDepth, float3 N, float2 reflection
 
 	reflections00 += ((max(0.0, NdotL) * SpecTerm(sIn) * 2.0 * (1.0 - H))) * shadow * pow(1.0 - reflections11.a, 4.0) * ocean::sunIntensity;
 	reflections00 = saturate(omni_spot + reflections00);
+
+	// [MOD] Far-field whitecap approximation.
+	float slopeXZ = length(N.xz);
+	float whitecapThreshold = lerp(0.7, 0.35, saturate(ocean::windFactor));
+	float whitecap = saturate((slopeXZ - whitecapThreshold) * 4.0) * saturate(ocean::windFactor * 2.0);
+
+	// Foam is high-albedo achromatic (~0.5 reflectance). Blend over the
+	// final water color before the Fresnel reflection blend.
+	float3 foamColor = saturate(ocean::sunColor * NdotL * 0.4 + 0.1);
+	diffuse = lerp(diffuse, foamColor, whitecap * 0.8);
 
 	return lerp(diffuse.rgb, reflections00, F);
 }

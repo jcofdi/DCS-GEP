@@ -81,6 +81,48 @@ void applyARPCOverrides(inout AtmosphereParameters atmosphere)
 	atmosphere.absorption_density.layers[1].exp_scale = 0;
 	atmosphere.absorption_density.layers[1].linear_term = -1.0 / (17830.355 / lenghtUnitsInMeter);
 	atmosphere.absorption_density.layers[1].constant_term = 2.25348;
+
+	// --- Supplementary aerosol (Mie) extinction ---
+	// The engine's analytical fog (gFogParams) provides Mie-like contrast
+	// reduction out to roughly 25 km, but GEP's extended terrain distances
+	// render geometry at 60-100+ km where no broadband extinction exists.
+	// The Bruneton LUT handles Rayleigh tinting correctly at those ranges
+	// but cannot produce achromatic contrast reduction on its own.
+	//
+	// Adding a small Mie extinction offset tells the Bruneton integrator
+	// that additional aerosols exist at sea level. The integrator uses the
+	// engine's Mie scale height (gAtmHM, typically 1.2 km) to compute
+	// the exponential density falloff, producing physically correct
+	// altitude-stratified haze:
+	//   - Horizontal paths at sea level: full extinction
+	//   - Paths to 3 km peaks: ~14% of sea-level extinction
+	//   - Paths to 5 km peaks: ~1.5% of sea-level extinction
+	//   - Air-to-air at altitude: negligible
+	//
+	// This is additive on top of the engine's per-mission Mie values, so
+	// weather variation (clear vs hazy missions) is preserved.
+	//
+	// The offset is applied to both extinction and scattering to conserve
+	// the single-scatter albedo (SSA). Real continental aerosols have
+	// SSA ~0.85-0.95; using 0.9 here models slightly absorbing particles
+	// (typical rural/continental mix). Higher SSA = brighter, whiter haze;
+	// lower SSA = darker, more absorbing haze.
+	//
+	// Coefficient guide (sea-level extinction, km^-1):
+	//   0.008 - very clear, minimal visible haze
+	//   0.012 - clear continental baseline
+	//   0.020 - moderate haze, good for most DCS theaters
+	//   0.035 - hazy / humid conditions
+	//
+	// At 0.012 km^-1 with gAtmHM = 1.2 km scale height:
+	//   30 km horizontal at sea level: transmittance ~0.70 (30% contrast loss)
+	//   60 km horizontal at sea level: transmittance ~0.49 (51% contrast loss)
+	//   80 km horizontal at sea level: transmittance ~0.38 (62% contrast loss)
+	//   60 km to a 3 km peak: transmittance ~0.92 (peak mostly clear)
+	static const float supplementaryMieExt = 0.016;
+	static const float supplementaryMieSSA = 0.93;
+	atmosphere.mie_extinction += supplementaryMieExt;
+	atmosphere.mie_scattering += supplementaryMieExt * supplementaryMieSSA;
 }
 
 /**

@@ -2,26 +2,21 @@
 #define TONEMAP_HLSL
 
 // =========================================================================
-// GEP toneMap.hlsl - Perceptual Tonemapping with Adaptive Hable Curve
+// GEP toneMap.hlsl - Hybrid Tonemapping with Stock Hable Curve
 // =========================================================================
-// Combines two approaches:
-//
-// 1. ICtCp perceptual color space (ITU-T T.302): intensity and chrominance
-//    processed independently using the ST.2084 PQ transfer function.
-//    Matches GT7/Polyphony Digital's reference implementation.
-//    Resolves Oklab's hue twist under extreme illuminant conditions.
-//
-// 2. Hable piecewise filmic curve with adaptive parameters: slope, toe,
-//    and whiteClip vary with scene brightness (avgLum) to match
-//    perceptual contrast sensitivity across lighting conditions.
-//    Night: gentle slope, deep toe crush, bright highlights.
-//    Day: steep slope, open shadows, moderate highlights.
-//
 // Architecture:
-//   Stock auto-exposure normalizes content center to ~0.18.
-//   Sub-linear exponent (Tonemap.fx) provides perceptual brightness envelope.
-//   Adaptive curve parameters reshape contrast per-condition.
-//   ICtCp decomposition with GT7 chroma preservation handles color.
+//   Luminance-based tonemapping for toe region (hue-preserving).
+//   Per-channel tonemapping for shoulder region (natural desaturation).
+//   Hybrid blend point derived from cbuffer shoulder value.
+//
+// The stock Hable piecewise curve with DCS's default parameters
+// (slope=0.865, toe=0.617, shoulder=0.322, whiteClip=0.04) has no
+// linear section (toe+shoulder < 1.0). The shoulder entry in output
+// space is exactly the cbuffer "shoulder" value. Per-channel behavior
+// is physically appropriate there: the decreasing curve slope naturally
+// desaturates highlights in proportion to brightness, matching the
+// cone saturation response. In the toe, luminance-based preserves
+// hue where the eye is most sensitive to color shifts.
 //
 // Preserved interfaces (required by Tonemap.fx, bloom.fx, etc):
 //   - getAvgLuminanceClamped(), getLinearExposure(), getLinearExposureMFD()
@@ -34,9 +29,12 @@
 #include "deferred/tonemapCommon.hlsl"
 #include "deferred/luminance.hlsl"
 #include "common/ambientCube.hlsl"
+#include "deferred/filmicCurve.hlsl"
 
-Buffer<float> histogram;
-Texture1D<float> tonemapLUT;
+#define OPERATOR_LUT 0
+
+Buffer<float>		histogram;
+Texture1D<float>	tonemapLUT;
 
 
 // =========================================================================
@@ -65,171 +63,61 @@ float getLinearExposureMFD(float averageLuminance) {
 
 
 // =========================================================================
-// GEP Adaptive Hable Curve Parameters
+// Post-curve reshaping: adaptive shadow recovery
 // =========================================================================
-// Three conditions define the curve shape across lighting scenarios.
-// Intermediate values are smoothstep-interpolated by unclamped avgLum.
+// Shadow detail recovery lifts very dark output pixels using a sqrt-
+// proportional ramp whose strength adapts to scene luminance.
 //
-// Night (avgLum <= 0.010): scotopic vision, low contrast sensitivity,
-//   deep shadow crush, bright point sources pop against dark background.
-//
-// Evening (avgLum ~0.045): mesopic transition, moderate contrast,
-//   balanced shadow/highlight handling.
-//
-// Day (avgLum >= 0.200): photopic vision, high contrast sensitivity,
-//   open shadows, punchy midrange.
-//
-// Shoulder and blackClip are fixed across all conditions.
+// highlightCompress is at no-op value (0.0). Highlight rolloff knee
+// references the cbuffer shoulder value directly so it tracks any
+// engine-side curve changes automatically.
 // =========================================================================
 
-// --- Night ---
-static const float gepNightSlope     = 0.865;
-static const float gepNightToe       = 0.550;
-static const float gepNightWhiteClip = 0.125;
+static const float midtoneGamma     = 1.0;
+static const float shadowStrength   = 0.40;
+static const float shadowNightMin   = 0.05;
+static const float shadowCeiling    = 0.06;
+static const float adaptLumLow      = 0.01;
+static const float adaptLumHigh     = 0.25;
+static const float highlightCompress = 0.0;
 
-// --- Evening ---
-static const float gepEveningSlope     = 0.900;
-static const float gepEveningToe       = 0.450;
-static const float gepEveningWhiteClip = 0.08;
-
-// --- Day ---
-static const float gepDaySlope     = 1.000;
-static const float gepDayToe       = 0.402;
-static const float gepDayWhiteClip = 0.050;
-
-// --- Fixed across all conditions ---
-static const float gepShoulder  = 0.322;
-static const float gepBlackClip = 0.000;
-
-// --- Transition points (unclamped avgLum) ---
-static const float gepNightEnd   = 0.010;  // night floor, below = pure night
-static const float gepEveningMid = 0.020;  // evening target
-static const float gepDayStart   = 0.200;  // day ceiling, above = pure day
-
-// GT7-style chroma preservation factor.
-// 0.6 = 60% chroma preserved regardless of brightness compression.
-// Perceptually motivated by the Hunt effect.
-static const float gepChromaPreserve = 0.6;
-
-
-// =========================================================================
-// ICtCp perceptual color space conversion (ITU-T T.302)
-// =========================================================================
-// ICtCp separates intensity (I) from chrominance (Ct, Cp) using the
-// ST.2084 PQ transfer function. Better hue stability than Oklab under
-// extreme illuminant conditions (sunrise/sunset).
-//
-// DCS outputs BT.709/sRGB. ICtCp operates in BT.2020. Gamut conversion
-// matrices bracket the transform.
-//
-// Reference: ITU-T T.302, GT7/Polyphony Digital (SIGGRAPH 2025)
-// =========================================================================
-
-// Gamut conversion matrices
-float3 bt709ToBt2020(float3 rgb)
+float reshapeCurve(float v)
 {
-	return float3(
-		0.6274 * rgb.r + 0.3293 * rgb.g + 0.0433 * rgb.b,
-		0.0691 * rgb.r + 0.9195 * rgb.g + 0.0114 * rgb.b,
-		0.0164 * rgb.r + 0.0880 * rgb.g + 0.8956 * rgb.b
-	);
-}
+	// Midtone gamma (1.0 = no-op)
+	v = pow(v, midtoneGamma);
 
-float3 bt2020ToBt709(float3 rgb)
-{
-	return float3(
-		 1.6605 * rgb.r - 0.5877 * rgb.g - 0.0728 * rgb.b,
-		-0.1246 * rgb.r + 1.1330 * rgb.g - 0.0084 * rgb.b,
-		-0.0182 * rgb.r - 0.1006 * rgb.g + 1.1187 * rgb.b
-	);
-}
+	// Adaptive shadow strength based on scene luminance
+	float avgLum = getAvgLuminanceClamped();
+	float adaptBlend = smoothstep(log10(adaptLumLow), log10(adaptLumHigh), log10(avgLum));
+	float strength = lerp(shadowNightMin, shadowStrength, adaptBlend);
 
-// ST.2084 PQ transfer function
-static const float PQ_REFERENCE_LUMINANCE = 100.0;
-static const float PQ_MAX_LUMINANCE = 10000.0;
+	// Shadow detail recovery: sqrt-proportional lift, hard-confined
+	if (v < shadowCeiling)
+	{
+		float t = v / shadowCeiling;
+		float sqrtMapped = shadowCeiling * sqrt(t);
+		float fade = 1.0 - t;
+		v = lerp(v, sqrtMapped, strength * fade);
+	}
 
-float pqForward(float v)
-{
-	float y = max(v * PQ_REFERENCE_LUMINANCE, 0) / PQ_MAX_LUMINANCE;
+	// Highlight rolloff (0.0 = no-op, knee tracks cbuffer shoulder)
+	float mask = smoothstep(shoulder, 1.0, v);
+	v -= highlightCompress * mask * mask;
 
-	static const float m1 = 0.1593017578125;
-	static const float m2 = 78.84375;
-	static const float c1 = 0.8359375;
-	static const float c2 = 18.8515625;
-	static const float c3 = 18.6875;
-
-	float ym = pow(y, m1);
-	return pow((c1 + c2 * ym) / (1.0 + c3 * ym), m2);
-}
-
-float pqInverse(float n)
-{
-	n = clamp(n, 0, 1);
-
-	static const float m1 = 0.1593017578125;
-	static const float m2 = 78.84375;
-	static const float c1 = 0.8359375;
-	static const float c2 = 18.8515625;
-	static const float c3 = 18.6875;
-
-	float np = pow(n, 1.0 / m2);
-	float l = max(np - c1, 0) / (c2 - c3 * np);
-	l = pow(l, 1.0 / m1);
-
-	return l * PQ_MAX_LUMINANCE / PQ_REFERENCE_LUMINANCE;
-}
-
-// ICtCp conversion
-float3 linearRGBToICtCp(float3 rgb709)
-{
-	float3 rgb2020 = bt709ToBt2020(rgb709);
-
-	float l = (rgb2020.r * 1688.0 + rgb2020.g * 2146.0 + rgb2020.b * 262.0) / 4096.0;
-	float m = (rgb2020.r * 683.0  + rgb2020.g * 2951.0 + rgb2020.b * 462.0) / 4096.0;
-	float s = (rgb2020.r * 99.0   + rgb2020.g * 309.0  + rgb2020.b * 3688.0) / 4096.0;
-
-	float lPQ = pqForward(l);
-	float mPQ = pqForward(m);
-	float sPQ = pqForward(s);
-
-	return float3(
-		(2048.0 * lPQ + 2048.0 * mPQ) / 4096.0,
-		(6610.0 * lPQ - 13613.0 * mPQ + 7003.0 * sPQ) / 4096.0,
-		(17933.0 * lPQ - 17390.0 * mPQ - 543.0 * sPQ) / 4096.0
-	);
-}
-
-float3 iCtCpToLinearRGB(float3 ictcp)
-{
-	float lPQ = ictcp.x + 0.00860904 * ictcp.y + 0.11103 * ictcp.z;
-	float mPQ = ictcp.x - 0.00860904 * ictcp.y - 0.11103 * ictcp.z;
-	float sPQ = ictcp.x + 0.560031 * ictcp.y - 0.320627 * ictcp.z;
-
-	float l = pqInverse(lPQ);
-	float m = pqInverse(mPQ);
-	float s = pqInverse(sPQ);
-
-	float3 rgb2020 = float3(
-		max( 3.43661 * l - 2.50645 * m + 0.06985 * s, 0),
-		max(-0.79133 * l + 1.98360 * m - 0.19227 * s, 0),
-		max(-0.02595 * l - 0.09891 * m + 1.12486 * s, 0)
-	);
-
-	return bt2020ToBt709(rgb2020);
+	return v;
 }
 
 
 // =========================================================================
-// Hable Piecewise Filmic Curve (adaptive parameters)
+// Hable Piecewise Filmic Curve (cbuffer parameters from engine)
 // =========================================================================
-// Toe and shoulder are power curve segments joined at a slope-controlled
-// junction. The curve operates in log10 luminance space.
+// slope, toe, shoulder, blackClip, whiteClip set by engine via cbuffer.
+// Operates in log10 luminance space.
 //
-// Parameters adapt to scene brightness via two-stage smoothstep:
-//   Night -> Evening -> Day
+// With stock DCS values (toe+shoulder=0.939 < 1.0), there is no
+// linear midsection. Curve transitions directly from toe to shoulder.
 //
 // Reference: John Hable, "Filmic Tonemapping with Piecewise Power Curves"
-// http://filmicworlds.com/blog/filmic-tonemapping-with-piecewise-power-curves/
 // =========================================================================
 
 float Curve(float c0, float c1, float ca, float curveSlope, float X)
@@ -240,49 +128,26 @@ float Curve(float c0, float c1, float ca, float curveSlope, float X)
 
 float TonemapFilmic(float logLuminance)
 {
-	// Two-stage interpolation keyed off unclamped avgLum.
-	// Night -> Evening: smoothstep(nightEnd, eveningMid)
-	// Evening -> Day:   smoothstep(eveningMid, dayStart)
-	float avgLum = max(getAverageLuminance(), 0.001);
-	float tNightToEvening = smoothstep(gepNightEnd, gepEveningMid, avgLum);
-	float tEveningToDay   = smoothstep(gepEveningMid, gepDayStart, avgLum);
-
-	float curveSlope = lerp(lerp(gepNightSlope,     gepEveningSlope,     tNightToEvening), gepDaySlope,     tEveningToDay);
-	float curveToe   = lerp(lerp(gepNightToe,       gepEveningToe,       tNightToEvening), gepDayToe,       tEveningToDay);
-	float curveWC    = lerp(lerp(gepNightWhiteClip,  gepEveningWhiteClip, tNightToEvening), gepDayWhiteClip, tEveningToDay);
-
-	float ta = (1 - curveToe - 0.18) / curveSlope - 0.733;
-	float sa = (gepShoulder - 0.18) / curveSlope - 0.733;
+	float ta = (1 - toe - 0.18) / slope - 0.733;
+	float sa = (shoulder - 0.18) / slope - 0.733;
 
 	if (logLuminance < ta)
-		return Curve(curveToe, gepBlackClip, ta, -curveSlope, logLuminance);
+		return Curve(toe, blackClip, ta, -slope, logLuminance);
 	else if (logLuminance < sa)
-		return curveSlope * (logLuminance + 0.733) + 0.18;
+		return slope * (logLuminance + 0.733) + 0.18;
 	else
-		return 1 - Curve(gepShoulder, curveWC, sa, curveSlope, logLuminance);
+		return 1 - Curve(shoulder, whiteClip, sa, slope, logLuminance);
 }
 
 
 // =========================================================================
-// GEP: Perceptual color volume tonemapping (ICtCp)
-// =========================================================================
-// The Hable curve is applied to scalar luminance in log10 space. ICtCp
-// decomposes color into intensity and chrominance on perceptually uniform
-// axes. Chroma is scaled using GT7's linear preservation blend
-// (gepChromaPreserve), providing a perceptual floor that prevents visible
-// desaturation for moderate brightness compression while still
-// desaturating extreme highlights toward white.
-//
-// Near-black fallback: PQ has finite slope at zero (stable), but
-// BT.709-to-BT.2020 rounding can shift color at very low values.
-// Blend to simple luminance scaling below lum 0.005.
-//
-// Near-neutral protection: ICtCp round-trip through BT.2020 can
-// produce pinkish tint on near-gray content (concrete, clouds) due
-// to small gamut conversion rounding errors amplified on near-zero
-// chroma. Blend to simple scaling when chroma magnitude is tiny.
+// Hybrid tonemapping: luminance-based in the toe, per-channel in the
+// shoulder, blended at the curve's shoulder entry point.
 // =========================================================================
 
+#if OPERATOR_LUT
+
+// LUT-based path
 float3 ToneMap_Filmic_Unrealic(float3 linearColor)
 {
 	const float3 LUM = { 0.2125, 0.7154, 0.0721 };
@@ -291,46 +156,76 @@ float3 ToneMap_Filmic_Unrealic(float3 linearColor)
 	if (lum <= 1e-6)
 		return 0;
 
-	// Apply the Hable curve to scalar luminance
+	// Luminance-based path
 	float logLum = log10(lum);
-	float tonemappedLum = TonemapFilmic(logLum);
+	float u = (logLum - LUTLogLuminanceMin) / (LUTLogLuminanceMax - LUTLogLuminanceMin);
+	float tonemappedLum = reshapeCurve(tonemapLUT.SampleLevel(gBilinearClampSampler, u, 0).r);
 
-	// Simple luminance scaling path (always stable, hue-preserving)
-	float scale = tonemappedLum / lum;
-	float3 simpleResult = max(linearColor * scale, 0);
+	float lumScale = tonemappedLum / lum;
+	float3 lumResult = linearColor * lumScale;
 
-	// Near-black: BT.709-to-BT.2020 rounding at very low values
-	float ictcpBlend = smoothstep(0.001, 0.005, lum);
+	// Gamut safety: ratio-preserving clamp
+	float maxC = max(lumResult.r, max(lumResult.g, lumResult.b));
+	if (maxC > 1.0)
+		lumResult /= maxC;
 
-	// ICtCp path: perceptually uniform intensity/chroma decomposition
-	float3 ictcp = linearRGBToICtCp(linearColor);
-	float I_in = ictcp.x;
+	// Per-channel path
+	float3 logColor = log10(max(linearColor, 1e-6));
+	float uR = (logColor.r - LUTLogLuminanceMin) / (LUTLogLuminanceMax - LUTLogLuminanceMin);
+	float uG = (logColor.g - LUTLogLuminanceMin) / (LUTLogLuminanceMax - LUTLogLuminanceMin);
+	float uB = (logColor.b - LUTLogLuminanceMin) / (LUTLogLuminanceMax - LUTLogLuminanceMin);
 
-	float I_out = linearRGBToICtCp(float3(tonemappedLum, tonemappedLum, tonemappedLum)).x;
+	float3 pcResult;
+	pcResult.r = reshapeCurve(tonemapLUT.SampleLevel(gBilinearClampSampler, uR, 0).r);
+	pcResult.g = reshapeCurve(tonemapLUT.SampleLevel(gBilinearClampSampler, uG, 0).r);
+	pcResult.b = reshapeCurve(tonemapLUT.SampleLevel(gBilinearClampSampler, uB, 0).r);
 
-	// GT7-style linear chroma preservation blend.
-	// gepChromaPreserve = 0.6: 60% chroma preserved regardless of compression.
-	// Perceptually motivated by the Hunt effect.
-	float I_ratio = (I_in > 1e-6) ? (I_out / I_in) : 0;
-
-	// Fade the chroma floor for extreme compression.
-	// At moderate compression (I_ratio 0.3-1.0), full preserve active.
-	// At extreme compression (I_ratio < 0.1), preserve fades toward
-	// zero, letting the sun and extreme highlights desaturate to white.
-	float preserveFade = smoothstep(0.02, 0.15, I_ratio);
-	float effectivePreserve = gepChromaPreserve * preserveFade;
-	float chromaScale = I_ratio * (1.0 - effectivePreserve) + effectivePreserve;
-	float2 ctcp_out = ictcp.yz * chromaScale;
-
-	float3 ictcpResult = max(iCtCpToLinearRGB(float3(I_out, ctcp_out)), 0);
-
-	// Near-neutral protection: ICtCp round-trip on near-gray content
-	// can produce pinkish tint from BT.2020 gamut conversion rounding.
-	float chromaMagnitude = length(ictcp.yz);
-	float neutralBlend = smoothstep(0.001, 0.01, chromaMagnitude);
-
-	return lerp(simpleResult, ictcpResult, neutralBlend * ictcpBlend);
+	// Shoulder-based blend: cbuffer "shoulder" is the exact output value
+	// where the curve's shoulder segment begins. Ramp width 0.20 gives
+	// a smooth transition across the shoulder onset.
+	float blend = smoothstep(shoulder, shoulder + 0.20, tonemappedLum);
+	return lerp(lumResult, pcResult, blend);
 }
+
+#else
+
+// Inline path (active)
+float3 ToneMap_Filmic_Unrealic(float3 linearColor)
+{
+	const float3 LUM = { 0.2125, 0.7154, 0.0721 };
+	float lum = dot(linearColor, LUM);
+
+	if (lum <= 1e-6)
+		return 0;
+
+	// Luminance-based path (toe: hue-preserving)
+	float logLum = log10(lum);
+	float tonemappedLum = reshapeCurve(TonemapFilmic(logLum));
+
+	float lumScale = tonemappedLum / lum;
+	float3 lumResult = linearColor * lumScale;
+
+	// Gamut safety: ratio-preserving clamp
+	float maxC = max(lumResult.r, max(lumResult.g, lumResult.b));
+	if (maxC > 1.0)
+		lumResult /= maxC;
+
+	// Per-channel path (shoulder: natural highlight desaturation)
+	float3 logColor = log10(max(linearColor, 1e-6));
+	float3 pcResult;
+	pcResult.r = reshapeCurve(TonemapFilmic(logColor.r));
+	pcResult.g = reshapeCurve(TonemapFilmic(logColor.g));
+	pcResult.b = reshapeCurve(TonemapFilmic(logColor.b));
+
+	// Shoulder-based blend: cbuffer "shoulder" is the exact output value
+	// where the curve's shoulder segment begins. Below this, luminance-
+	// based preserves hue in the toe. Above this, per-channel provides
+	// natural desaturation from the curve's decreasing slope.
+	float blend = smoothstep(shoulder, shoulder + 0.20, tonemappedLum);
+	return lerp(lumResult, pcResult, blend);
+}
+
+#endif
 
 
 // =========================================================================

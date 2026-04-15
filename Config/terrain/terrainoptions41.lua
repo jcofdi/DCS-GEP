@@ -38,11 +38,19 @@ distances =
 	-- JC: Extended LOD ring distances for sharp terrain silhouettes at altitude
 	surfaceLod =
 	{
-		{0, 0, 3000, 6000};                                             -- LOD 0: was 0-4km, now 0-6km
-		{6000, 6000, surface5_transition_distance(6000, 14000), 14000}; -- LOD 1: was 4-8km, now 6-14km
-		{14000, 14000, surface5_transition_distance(14000, 28000), 28000}; -- LOD 2: was 8-16km, now 14-28km
-		{28000, 28000, 80000, 200000};                                  -- LOD 3: was 16-150km, now 28-200km
- 	};
+		{0, 0, 3000, 6000};
+		{6000, 6000, surface5_transition_distance(6000, 14000), 14000};
+		{14000, 14000, surface5_transition_distance(14000, 60000), 60000};
+		{60000, 60000, 80000, 100000};
+	};	
+	
+--	surfaceLod =
+--	{
+--		{0, 0, 3000, 6000};                                             -- LOD 0: was 0-4km, now 0-6km
+--		{6000, 6000, surface5_transition_distance(6000, 14000), 14000}; -- LOD 1: was 4-8km, now 6-14km
+--		{14000, 14000, surface5_transition_distance(14000, 28000), 28000}; -- LOD 2: was 8-16km, now 14-28km
+--		{28000, 28000, 80000, 200000};                                  -- LOD 3: was 16-150km, now 28-200km
+ --	};
 
 	-- JC: Pushed from 20km to 30km to cover approach/departure visual range
 	uniqueScene = 30000.0;  -- was 20000

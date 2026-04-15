@@ -1,0 +1,144 @@
+#ifndef SHADING_COMMON_HLSL
+#define SHADING_COMMON_HLSL
+
+#ifndef PLUGIN_3DSMAX
+	#include "common/context.hlsl"
+	#include "common/BRDF.hlsl"
+	#include "common/samplers11.hlsl"
+	#include "deferred/deferredCommon.hlsl"
+
+	Texture2D<float2> preintegratedGF: register(t117);
+#endif
+
+#ifndef CALCULATE_ENV_BRDF
+	#define CALCULATE_ENV_BRDF 0
+#endif
+
+float Diffuse_Multiscattering(float NdotL, float NdotV, float NdotH,
+                              float LdotH, float roughness) {
+    float gloss = 1.0 - roughness;
+
+    // f0: rough foundation (retroreflective at grazing)
+    float oneMinusLdotH = 1.0 - LdotH;
+    float oneMinusLdotH2 = oneMinusLdotH * oneMinusLdotH;
+    float oneMinusLdotH5 = oneMinusLdotH2 * oneMinusLdotH2 * oneMinusLdotH;
+    float Fd0 = LdotH + oneMinusLdotH5;
+
+    // f1: smooth energy-conserving diffuse
+    float fNdotL = 1.0 - pow(1.0 - NdotL, 5);
+    float fNdotV = 1.0 - pow(1.0 - NdotV, 5);
+    float Fd1 = lerp(1.0, 0.25, 1.0 - fNdotL) * lerp(1.0, 0.25, 1.0 - fNdotV);
+
+    // Interpolate based on gloss
+    float t = saturate(2.2 * gloss - 0.5);
+    float Fd = lerp(Fd0, Fd1, t);
+
+    // Extra retroreflective bump at grazing angles - disabled as didn't mesh with DCS materials well
+    // float A = 34.5 * gloss * gloss - 59.0 * gloss + 24.5;
+    // float B = max(73.2 * gloss - 21.2, 8.9);
+    // Fd += A * exp2(-B * sqrt(NdotH)) * LdotH;
+
+    return Fd;  // does not include albedo/PI
+}
+
+float3 ShadingSimple(float3 diffuseColor, float3 specularColor, float roughness, float3 normal, float3 viewDir, float3 lightDir, float2 energyLobe = float2(1,1))
+{
+	float3 H = normalize(lightDir + viewDir);
+	float NoH = max(0, dot(normal, H));
+	float VoH = max(0, dot(viewDir, H));
+	float3 diffuse = Diffuse_lambert(diffuseColor);
+	float3 brdf = Fresnel_schlick(specularColor, VoH) * ( D_ggx(roughness, NoH) * Visibility_implicit() );
+	return diffuse * energyLobe.x + brdf * energyLobe.y;
+}
+
+float3 ShadingDefault(float3 diffuseColor, float3 specularColor, float roughness, float3 normal, float3 viewDir, float3 lightDir, float2 energyLobe = float2(1,1))
+{
+	float3 H = normalize(lightDir + viewDir);
+	float NoH = max(0, dot(normal, H));
+	float NoV = max(0, dot(normal, viewDir)) + 1e-5;
+	float NoL = max(0, dot(normal, lightDir));
+	float VoH = max(0, dot(viewDir, H));
+
+	float LdotH = max(0, dot(lightDir, H));
+	float Fd = Diffuse_Multiscattering(NoL, NoV, NoH, LdotH, roughness);
+	float3 diffuse = diffuseColor * Fd * (1.0 / 3.1415926535897932);
+
+	float3 brdf = Fresnel_schlick(specularColor, VoH) * ( D_ggx(roughness, NoH) * Visibility_smithJA(roughness, NoV, NoL) );
+	// float brdf = D_ggx(roughness, NoH) * Fresnel_schlick(specularColor, VoH) * Visibility_implicit();
+	//float3 brdf = D_blinn(roughness, NoH) * Fresnel_schlick(specularColor, VoH) * Visibility_smith(roughness, NoV, NoL);
+	// float brdf =  D_blinn(roughness, NoH) * Fresnel_schlick(specularColor, VoH) * Visibility_neumann(NoV, NoL);	
+
+	return diffuse * energyLobe.x + brdf * energyLobe.y;
+}
+
+float3 EnvBRDF(float3 specularColor, float roughness, float metallic, float3 normal, float3 viewDir, float3 lightDir)
+{
+	float3 H = normalize(lightDir + viewDir);
+	float NoH = max(0, dot(normal, H));
+	float NoV = max(0, dot(normal, viewDir));
+	float NoL = max(0, dot(normal, lightDir));
+	float VoH = max(0.0001, dot(viewDir, H));
+
+#if CALCULATE_ENV_BRDF
+	float vis = Visibility_smith(roughness, NoV, NoL);
+	return Fresnel_schlick(specularColor, VoH) * ( NoL * vis * (4 * VoH / NoH) );
+#else
+	float2 GF = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, NoV), 0);
+	return specularColor * GF.x + saturate(50.0 * specularColor.g) * GF.y;
+#endif
+}
+
+float3 EnvBRDFApprox(float3 specularColor, float roughness, float NoV) {
+	const float4 c0 = { -1, -0.0275, -0.572, 0.022 };
+	const float4 c1 = { 1, 0.0425, 1.04, -0.04 };
+	float4 r = roughness * c0 + c1;
+	float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+	float2 GF = float2(-1.04, 1.04) * a004 + r.zw;
+	return specularColor * GF.x + saturate(50.0 * specularColor.g) * GF.y;
+}
+
+float3 EnvBRDFApprox(float3 specularColor, float roughness, float3 normal, float3 viewDir) {
+	float NoV = max(0, dot(normal, viewDir));
+	return EnvBRDFApprox(specularColor, roughness, NoV);
+}
+
+// ---------------------------------------------------------------------------
+// Multiscatter energy compensation (Kulla & Conty 2017, Filament formulation).
+//
+// Single-scattering GGX discards light that bounces between microfacets.
+// At roughness 1.0 with f0 = 1.0, ~60% of energy is lost.
+// This function returns a per-channel multiplier that recovers the lost
+// energy for the specular lobe.
+//
+// The compensation is derived from the same polynomial that EnvBRDFApprox
+// uses: GF.y is the view-dependent single-scatter albedo at f0 = 0 (the
+// "bias" term). The ratio 1/GF.y - 1 represents how much energy was lost
+// relative to what was captured. Scaling by specularColor (f0) accounts
+// for absorption on each additional bounce, colored metals gain both
+// brightness and saturation, which is physically correct.
+//
+// Reference:
+//   Kulla, Conty. "Revisiting Physically Based Shading at Imageworks."
+//     SIGGRAPH 2017 PBS Course.
+//   Filament documentation, §4.7.2 "Energy loss in specular reflectance."
+//     https://google.github.io/filament/Filament.md.html
+// ---------------------------------------------------------------------------
+float3 SpecularEnergyCompensation(float3 specularColor, float roughness, float NoV)
+{
+	// Recompute the GF bias term from the same Karis polynomial used by
+	// EnvBRDFApprox. This avoids modifying EnvBRDFApprox's signature.
+	const float4 c0 = { -1, -0.0275, -0.572, 0.022 };
+	const float4 c1 = { 1, 0.0425, 1.04, -0.04 };
+	float4 r = roughness * c0 + c1;
+	float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+	float2 GF = float2(-1.04, 1.04) * a004 + r.zw; // GF.y - the f0-independent term
+	float Ess = GF.x + GF.y;
+
+	// Filament formula: 1 + f0 * (1/bias - 1)
+	// At low roughness bias ≈ 1 → compensation ≈ 1 (no change).
+	// At high roughness bias shrinks → compensation grows.
+	// Clamp bias to avoid division by zero at extreme angles.
+	return 1.0 + specularColor * (1.0 / max(Ess, 0.001) - 1.0);
+}
+
+#endif

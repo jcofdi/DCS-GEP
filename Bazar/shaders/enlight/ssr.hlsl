@@ -150,7 +150,15 @@ float4 RAYMARCH(float3 pos, float3 dir, float offset)
 { // in view space, dir must be normalized
 
 #if 1
-	float jitterStep = (1 + (rand(pos)-0.25)) * stepSize;
+	// Scale step size by FOV to maintain consistent pixel-stride across
+	// all zoom levels. gProj[1][1] = 1/tan(fovY/2), larger at narrow FOV.
+	// At the 56-degree reference FOV (gProj[1][1] ~= 1.88), fovScale = 1.0
+	// and stepSize is unchanged from ED's original tuning.
+	// At narrow FOV (zoomed in), steps shrink to avoid stepping over thin
+	// geometry. At wide FOV, steps grow to reach further across the viewport.
+	float fovScale = 1.8807 / gProj[1][1];
+	float adjustedStepSize = stepSize * fovScale;
+	float jitterStep = (1 + (rand(pos)-0.25)) * adjustedStepSize;
 #else
 	float jitterStep = stepSize;
 #endif
@@ -162,6 +170,9 @@ float4 RAYMARCH(float3 pos, float3 dir, float offset)
 
 	float prevRayLen = 0;
 
+	#ifdef SSR_STATIC_NOISE
+	[loop]
+	#endif
 	for (uint i = 0; i < sampleSteps; ++i) {
 		jitterStep *= stepMult;
 		float rayLen = i * jitterStep;
@@ -172,27 +183,10 @@ float4 RAYMARCH(float3 pos, float3 dir, float offset)
 
 		float3 rayEnd = pos + dir * t;
 		float2 screenCoord = getScreenCoord(rayEnd);
-
-		// Early-out: ray exited the viewport. DepthSampler BORDER mode
-		// returns 0 for OOB reads, which getDepth() reconstructs as a
-		// near-plane Z value — causing false hits at screen borders.
-		if (any(screenCoord < 0) || any(screenCoord > 1))
-			return 0;
-
 		float depth = getDepth(screenCoord);
-		float delta = rayEnd.z - depth - 0.5;	// -0.5 fix water to water reflection
+		float delta = rayEnd.z - depth - 0.5;
 		float delta2 = depth - pos.z + offset;
-//		if (delta > 0) {
-		if (delta > 0 && delta2 > lerp(delta, 0, saturate(rayEnd.z*0.0002)) ) {		// 5km far to check delta2 
-			// [MOD] Reject SSR hits at extreme depth (sky, clouds, far plane).
-			// Screen-space reflections have no physical validity for objects
-			// tens of km away -- those should come from the environment map.
-			// Threshold ~10km in view-space Z; anything beyond is atmosphere.
-			if (depth > 50000.0)
-				continue;
-			// Binary search refinement: bisect between previous step (in front)
-			// and current step (behind surface) to converge on intersection.
-			// 5 iterations reduce positional error by 32x.
+		if (delta > 0 && delta2 > lerp(delta, 0, saturate(rayEnd.z*0.0002)) ) {
 			float lo = prevRayLen;
 			float hi = rayLen;
 
@@ -211,7 +205,6 @@ float4 RAYMARCH(float3 pos, float3 dir, float offset)
 					lo = mid;
 			}
 
-			// Sample color at refined intersection
 			float finalMid = (lo + hi) * 0.5;
 			float3 finalSp = pp + dp0 * finalMid;
 			float finalT = -cross(finalSp, pos).z / cross(finalSp, dir).z;
@@ -222,7 +215,7 @@ float4 RAYMARCH(float3 pos, float3 dir, float offset)
 
 		prevRayLen = rayLen;
 	}
-
+	
 	return 0;// float4(1, 0, 1, 1);
 }
 
