@@ -258,7 +258,7 @@ float SampleShadowMap(float3 wPos, float NoL, uniform uint idx, uniform bool use
 		baseAngle = rnd(projPos.xy / projPos.w) * (2.0 * PI_VAL);
 #endif
 		// Start from i=1 because i=0 is the center tap already in acc.
-		[unroll(samplesMax)]
+		[loop]
 		for (uint i = 1; i < count; ++i) {
 			float t = ((float)i + 0.5) / (float)count;
 			float angle = baseAngle + (float)i * goldenAngle;
