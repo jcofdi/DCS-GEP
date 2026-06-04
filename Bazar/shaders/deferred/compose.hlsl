@@ -440,7 +440,7 @@ float3 ComposeCockpitSample(ComposerInput i, uint idx, uniform bool useShadows, 
 
 	float3 viewDir = normalize(gCameraPos.xyz - wPos);
 	float3 sunColor = SampleSunRadiance(wPos, gSunDir) * terranAndCloudsShadow;
-	float3 finalColor = ShadeCockpit(uv, useCockpitGI, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, cascadeShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), false, 1, useSSLR, uvSSLR, float3(0,0,0), bakedAO);
+	float3 finalColor = ShadeCockpit(uv, useCockpitGI, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, cascadeShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), false, 1, useSSLR, uvSSLR, bakedAO, float3(0,0,0));
 
 	return finalColor;
 #endif
