@@ -19,31 +19,8 @@ float modifyRoughnessByCloudShadow(float roughness, float cloudShadow)
     return roughness;
 }
 
-// =============================================================================
 // Shadow-compensated AO: approximate missing local bounce illumination
-// =============================================================================
-//
-// In shadowed concavities (wing roots, intake ducts, underbelly), AO correctly
-// reduces IBL contribution based on reduced sky-hemisphere visibility. However,
-// in a real scene, nearby sunlit surfaces bounce significant diffuse energy into
-// these regions - energy the environment cubemap cannot capture because it
-// represents distant sky, not local geometry.
-//
-// Without GI, this bounce light is entirely absent. AO then over-penalizes the
-// only remaining light source (IBL), producing shadows darker than reference.
-//
-// Compensation: relax AO strength on IBL terms in proportion to how much the
-// surface is already in shadow. When shadow ≈ 0, reduce AO penalty by
-// BOUNCE_APPROX_STRENGTH fraction, approximating the bounce fill that would
-// have partially offset the reduced sky visibility.
-//
-// The shadow value reaching ShadeSolid is finalShadow = min(cascade, terrain,
-// sss, clouds), which is the correct combined signal - any shadow source
-// produces the same bounce-light deficit.
-//
-// Tuning:
 //   0.0 = disabled, AO always at full strength (stock behavior)
-//
 static const float BOUNCE_APPROX_STRENGTH = 0.0;
 
 float compensateAOForMissingBounce(float AO, float shadow)
@@ -55,53 +32,6 @@ float compensateAOForMissingBounce(float AO, float shadow)
 	return lerp(1.0, AO, aoScale);
 }
 
-// Albedo-aware multi-bounce AO (Jimenez et al. 2016, Appendix B Eq. 33)
-// High-albedo surfaces return more light from inter-reflections,
-// so effective AO is weaker. Dark surfaces absorb and stay dark.
-float3 MultiBounceAO(float ao, float3 albedo) {
-    float3 a = 2.0404 * albedo - 0.3324;
-    float3 b = -4.7951 * albedo + 0.6417;
-    float3 c = 2.7552 * albedo + 0.6903;
-    return max(ao, ((ao * a + b) * ao + c) * ao);
-}
-
-// =============================================================================
-// Cone-based direct light micro-shadowing (Chan, SIGGRAPH 2018, Eq. 58)
-// =============================================================================
-//
-// AO currently has zero effect on direct sunlight. Shadow cascades operate
-// at meter-scale resolution; GTAO operates at centimeter scale. Panel gaps,
-// control surface edges, intake lips, and pylon-fuselage junctions all have
-// strong AO that shadow cascades miss entirely.
-//
-// The scalar AO visibility converts to an equivalent cone half-angle via
-// the Nusselt analog (Jimenez Eq. 22): cos(theta) = sqrt(1 - AO).
-// If the sun direction's N.L falls below this cone threshold, the direct
-// light contribution is reduced with a squared falloff for a sharp but
-// smooth transition.
-//
-// Surfaces with AO = 1.0 (flat, unoccluded) get microShadow = 1.0 (no
-// change). Only surfaces that already have AO darkening receive additional
-// direct-light attenuation.
-// =============================================================================
-float MicroShadow(float AO, float NoL, float3 normal, float3 bentNormal)
-{
-    float cosConeAngle = sqrt(1.0 - AO);
-    float microShadow = saturate(NoL / max(cosConeAngle, 0.001));
-    microShadow *= microShadow;
-
-    // Engagement based on bent normal deviation from geometric normal.
-    // Genuine occlusion tilts the bent normal away from the surface
-    // normal. Proximity halos produce mild AO without directional
-    // deviation -- the bent normal stays aligned with the geometric
-    // normal because no actual hemisphere is blocked.
-    float bentDeviation = 1.0 - saturate(dot(normal, bentNormal));
-    // bentDeviation: 0.0 = identical (no real occlusion direction)
-    //                0.3+ = significant tilt (real concavity)
-    float engagement = smoothstep(0.02, 0.15, bentDeviation);
-    return lerp(1.0, microShadow, engagement);
-}
-
 // Specular occlusion (Lagarde, Moving Frostbite to PBR, 2014)
 //
 // Empirical approximation that derives specular occlusion from scalar AO,
@@ -109,11 +39,23 @@ float MicroShadow(float AO, float NoL, float3 normal, float3 bentNormal)
 // surfaces regardless of viewing angle. Smooth surfaces with low AO get
 // stronger attenuation; rough surfaces are more forgiving.
 //
-// Upgrade path: replace with GTSO 4D LUT (Jimenez Section 7) when a
-// texture slot is available for the precomputed table.
 float SpecularOcclusion(float AO, float roughness, float NoV)
 {
     return saturate(pow(NoV + AO, exp2(-16.0 * roughness - 1.0)) - 1.0 + AO);
+}
+
+// Multi-bounce specular occlusion (extends Jimenez 2016 Appendix B
+// to the specular channel). High-reflectance metallic surfaces in
+// concavities retain more specular energy through inter-reflection.
+// Same polynomial as MultiBounceAO but driven by specularColor:
+// each bounce multiplies by the surface's spectral reflectance,
+// so gold tints warm, aluminum stays neutral, dielectrics at 0.04
+// get negligible lift.
+float3 MultiBounceSpecOcc(float specOcc, float3 specularColor) {
+    float3 a = 2.0404 * specularColor - 0.3324;
+    float3 b = -4.7951 * specularColor + 0.6417;
+    float3 c = 2.7552 * specularColor + 0.6903;
+    return max(specOcc, ((specOcc * a + b) * specOcc + c) * specOcc);
 }
 
 // =============================================================================
@@ -125,10 +67,17 @@ float SpecularOcclusion(float AO, float roughness, float NoV)
 // mirror reflection direction.
 float3 EvaluateSunBRDF(float3 diffuseColor, float3 specularColor,
 	float roughness, float3 normal, float3 viewDir, float NoL, float NoV,
-	float2 energyLobe)
+	float2 energyLobe, float metallic, float3 energyComp, float cloudShadow)
 {
-	static const float SUN_COS_ANGLE = 0.99998918;  // cos(0.00465 rad)
-	static const float SUN_SIN_ANGLE = 0.00464999;  // sin(0.00465 rad)
+	// Dynamic sun disc: cloud cover forward-scatters sunlight into a
+	// broader apparent source. Clear sky uses the physical 0.265° radius.
+	// Quadratic ramp emphasizes broadening at heavy cloud where
+	// forward scattering dominates.
+	float cloudInfluence = 1.0 - cloudShadow;
+	float sunAngle = lerp(0.00465, 0.12, cloudInfluence * cloudInfluence);
+	// Small-angle approximation: cos(x) ≈ 1-x²/2, sin(x) ≈ x
+	float sunCosAngle = 1.0 - 0.5 * sunAngle * sunAngle;
+	float sunSinAngle = sunAngle;
 
 	// Diffuse: Frostbite renormalized Disney
 	float3 H_diff = normalize(gSunDir + viewDir);
@@ -139,23 +88,35 @@ float3 EvaluateSunBRDF(float3 diffuseColor, float3 specularColor,
 	float lightScatter = 1.0 + (fd90 - 1.0) * pow(1.0 - NoL, 5);
 	float viewScatter  = 1.0 + (fd90 - 1.0) * pow(1.0 - NoV, 5);
 	float Fd = lightScatter * viewScatter * energyFactor;
-	float3 sunDiffuse = diffuseColor * Fd * (1.0 / 3.1415926535897932);
 
 	// Specular: closest point on sun disc to mirror reflection
 	float3 R_sun = reflect(-viewDir, normal);
 	float DdotR = dot(gSunDir, R_sun);
 	float3 S = R_sun - DdotR * gSunDir;
 	float sLen = max(length(S), 1e-6);
-	float3 Lspec = DdotR < SUN_COS_ANGLE
-		? normalize(SUN_COS_ANGLE * gSunDir + (S / sLen) * SUN_SIN_ANGLE)
+	float3 Lspec = DdotR < sunCosAngle
+		? normalize(sunCosAngle * gSunDir + (S / sLen) * sunSinAngle)
 		: R_sun;
 
 	float3 H_spec = normalize(Lspec + viewDir);
 	float NoH_spec = max(0, dot(normal, H_spec));
 	float NoL_spec = max(0, dot(normal, Lspec));
 	float VoH_spec = max(0, dot(viewDir, H_spec));
-	float3 sunSpecular = Fresnel_schlick(specularColor, VoH_spec)
-		* (D_ggx(roughness, NoH_spec) * Visibility_smithJA(roughness, NoV, NoL_spec));
+
+	// Fresnel at specular half-vector angle
+	float3 F = Fresnel_schlick(specularColor, VoH_spec);
+
+	// Direct sun specular with multi-scatter energy compensation.
+	// Microsurface inter-reflections are light-source-agnostic.
+	float3 sunSpecular = F
+		* (D_ggx(roughness, NoH_spec) * Visibility_smithGGX(roughness, NoV, NoL_spec));
+	sunSpecular *= energyComp;
+
+	// Direct sun diffuse Fresnel coupling: (1-F) partitions energy
+	// between specular and diffuse for punctual lights. For IBL, the
+	// hemispherically integrated E_ms is correct instead.
+	float3 kD_direct = (1.0 - F) * (1.0 - metallic);
+	float3 sunDiffuse = kD_direct * diffuseColor * Fd * (1.0 / 3.1415926535897932);
 
 	return sunDiffuse * energyLobe.x + sunSpecular * energyLobe.y;
 }
@@ -175,23 +136,65 @@ float3 BlendSSLR(float3 envLightSpecular, float2 uvSSLR, float roughnessMip, flo
 	return lerp(envLightSpecular, sslr.rgb, sslr.a);
 }
 
-float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1, 1), uniform uint selectEnvCube = LERP_ENV_MAP, float lerpEnvCubeFactor = 0, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), uniform bool insideCockpit = false, float3 bentNormal = float3(0,0,0))
+float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1, 1), uniform uint selectEnvCube = LERP_ENV_MAP, float lerpEnvCubeFactor = 0, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), uniform bool insideCockpit = false, float bakedAO = 1.0)
 {
-	bool hasBentNormal = dot(bentNormal, bentNormal) > 0.5;
 
-	// Suppress GTAO convex-surface artifacts at grazing angles.
-	float grazingAOFade = smoothstep(0.1, 0.4, dot(normal, viewDir));
-	float fadedAO = lerp(1.0, AO, grazingAOFade);
+	// Suppress GTAO convex-surface artifacts at grazing for diffuse IBL.
+	float novFade = smoothstep(0.1, 0.4, dot(normal, viewDir));
+	float fadedAO = lerp(bakedAO, AO, novFade);
 
 	float roughnessSun = modifyRoughnessByCloudShadow(roughness, cloudShadow);
 	float NoL = max(0, dot(normal, gSunDir));
 	float NoV = max(0, dot(normal, viewDir)) + 1e-5;
 
+	// ===================================================================
+	// Preintegrated BRDF LUT — single fetch drives all energy consumers.
+	// Hill-corrected multi-scatter (selfshadow.com 2018, Part 2):
+	// Favg² numerator prevents desaturation on colored metals by properly
+	// modeling Fresnel compounding across multiple microsurface bounces.
+	// ===================================================================
+	float2 GF_lut = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, NoV), 0);
+	float Ess = GF_lut.x + GF_lut.y;
+	float3 Fss = specularColor * GF_lut.x + saturate(50.0 * specularColor.g) * GF_lut.y;
+
+	// Hemisphere-averaged single-scatter albedo: Eavg is the cosine-weighted
+	// mean of Ess over all viewing angles, used by the multi-scatter geometric
+	// series. Sampled at NoV=0.5 (~60°, the cosine-weighted mean direction).
+	float2 GF_avg = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, 0.5), 0);
+	float Eavg = GF_avg.x + GF_avg.y;
+
+	// Hemisphere-averaged Fresnel (closed-form for Schlick)
+	float3 Favg = specularColor + (1.0 / 21.0) * (1.0 - specularColor);
+	// Hill's Favg² fix (selfshadow.com 2018, Part 2): each additional bounce
+	// attenuates by Favg. Eavg (not Ess) is the escape probability per bounce
+	// because inter-microfacet scattering randomizes direction.
+	float3 Fms = (Favg * Favg * Eavg) / max(1.0 - Favg * (1.0 - Eavg), 0.001);
+	float3 energyComp = 1.0 + Fms * (1.0 / max(Ess, 0.001) - 1.0);
+
+	// Fdez-Agüera (JCGT 2019): multi-scatter energy routed through hemisphere
+	// irradiance rather than directional cubemap. Single-scatter retains
+	// directional information; multi-scatter has lost it after multiple bounces.
+	float3 FmsEms = Fms * (1.0 - Ess);
+
+	// Specular IBL: single-scatter weight (directional cubemap)
+	float3 specColor_ss = Fss;
+
+	// Diffuse coupling (Fdez-Agüera eq. for dielectrics):
+	// diffuse receives energy not claimed by single-scatter or multi-scatter.
+	float3 kD = diffuseColor * (1.0 - (Fss + FmsEms));
+
 	// Direct sun: disc area light with split diffuse/specular evaluation
+	// (retains multiplicative energyComp — Dassault f_ms lobe is a future refinement)
 	float3 sunBRDF = EvaluateSunBRDF(diffuseColor, specularColor,
-		roughnessSun, normal, viewDir, NoL, NoV, energyLobe);
-	float3 lightAmount = sunColor * (gSunIntensity * NoL * shadow
-		* MicroShadow(fadedAO, NoL, normal, hasBentNormal ? bentNormal : normal));
+		roughnessSun, normal, viewDir, NoL, NoV, energyLobe,
+		metallic, energyComp, cloudShadow);
+	float microShadow = 1.0;
+	if (bakedAO < 0.999) {
+		float cosConeAngle = sqrt(1.0 - bakedAO);
+		microShadow = saturate(NoL / max(cosConeAngle, 0.001));
+		microShadow *= microShadow;
+	}
+	float3 lightAmount = sunColor * (gSunIntensity * NoL * min(shadow, microShadow)); // using min() for microshadow addition to prevent microshadow from overdarkening any areas previously already in shadow
 	float3 finalColor = sunBRDF * lightAmount;
 
 	// IBL AO
@@ -211,8 +214,15 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 	{
 		envLightDiffuse = SampleEnvironmentMap(eis, normal, 1.0, environmentMipsCount, selectEnvCube, lerpEnvCubeFactor);
 	}
+	
 	float3 mbAO = MultiBounceAO(iblAO, diffuseColor);
-	finalColor += diffuseColor * envLightDiffuse * (gIBLIntensity * mbAO * energyLobe.x);
+	// Gate multi-bounce lift by hemisphere visibility. At low AO,
+	// minimal light enters the cavity to inter-reflect — the bounce
+	// model overestimates energy retention in open cavities where
+	// most reflected light escapes through the opening.
+	float diffMBBlend = smoothstep(0.05, 0.4, iblAO);
+	mbAO = lerp(iblAO, mbAO, diffMBBlend);
+	finalColor += (FmsEms + kD) * envLightDiffuse * (gIBLIntensity * mbAO * energyLobe.x);
 
 	// Specular IBL
 	float a = roughness * roughness;
@@ -249,20 +259,45 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 			envLightSpecular = BlendSSLR(envLightSpecular, uvSSLR, roughnessMip, NoV);
 	}
 
-#if USE_BRDF_K
-	float3 specColor = EnvBRDFApproxK(specularColor, roughness, NoV, gDev1.w);
-#else
-	float3 specColor = EnvBRDFApprox(specularColor, roughness, NoV);
-#endif
-	specColor *= SpecularEnergyCompensation(specularColor, roughness, NoV);
+	// Re-tint specular IBL at grazing angles on rough surfaces.
+	// Cubemap mip blur destroys directional color at high roughness;
+	// the ambient cube retains it. Operates in chromaticity space:
+	// only hue shifts, luminance is preserved exactly.
+	{
+		float rimTintWeight = saturate(roughness - 0.3) * saturate(pow(1.0 - NoV, 3) * 2.0);
+		float3 ambientTint = AmbientLight(R);
+		float ambientLum  = dot(ambientTint, float3(0.2126, 0.7152, 0.0722));
+		float specularLum = dot(envLightSpecular, float3(0.2126, 0.7152, 0.0722));
 
-	float specOcc = SpecularOcclusion(fadedAO, roughness, NoV);
-	finalColor += envLightSpecular * specColor * (specOcc * energyLobe.y);
+		float3 specChroma    = envLightSpecular / max(specularLum, 0.001);
+		float3 ambientChroma = ambientTint / max(ambientLum, 0.001);
+		float3 blendedChroma = lerp(specChroma, ambientChroma, rimTintWeight);
+		envLightSpecular = blendedChroma * specularLum;
+	}
+
+	// LUT-calibrated specular occlusion. Same Lagarde structure but the
+	// exponent comes from the preintegrated BRDF (Ess = single-scatter
+	// directional albedo) rather than the empirical exp2(-16r-1) fit.
+	// Tight BRDF lobes (high Ess) track AO closely; wide lobes (low Ess)
+	// are forgiving because the lobe overlaps most of the visible hemisphere.
+	float specOcc = saturate(pow(NoV + fadedAO, Ess) - 1.0 + fadedAO);
+	specOcc = max(specOcc, 0.08);
+
+	// Multi-bounce specular: gate lift by hemisphere visibility.
+	// At low AO, minimal light enters the cavity to inter-reflect.
+	// At moderate-high AO, inter-reflection is physically meaningful.
+	float3 mbSpecOcc = MultiBounceSpecOcc(specOcc, specularColor);
+	float mbBlend = smoothstep(0.1, 0.4, fadedAO);
+	float3 finalSpecOcc = lerp(specOcc, mbSpecOcc, mbBlend);
+
+	// Single-scatter specular IBL: directional cubemap × Fss (no energyComp).
+	// Multi-scatter energy is routed through irradiance above.
+	finalColor += envLightSpecular * specColor_ss * (finalSpecOcc * energyLobe.y);
 
 	return finalColor;
 }
 
-float3 ShadeSolid(float3 pos, float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float AO, float2 cloudShadowAO, float3 viewDir, float2 energyLobe = float2(1,1), uniform uint selectEnvCube = LERP_ENV_MAP, float lerpEnvCubeFactor = 0, uniform bool useSSLR = false, float2 uvSSLR =  float2(0,0), uniform bool insideCockpit = false, float3 bentNormal = float3(0,0,0))
+float3 ShadeSolid(float3 pos, float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float AO, float2 cloudShadowAO, float3 viewDir, float2 energyLobe = float2(1,1), uniform uint selectEnvCube = LERP_ENV_MAP, float lerpEnvCubeFactor = 0, uniform bool useSSLR = false, float2 uvSSLR =  float2(0,0), uniform bool insideCockpit = false, float bakedAO = 1.0)
 {
 #if	USE_DEBUG_ROUGHNESS_METALLIC
 	roughness = clamp(roughness + gDev0.z, 0.02, 0.99);
@@ -273,10 +308,20 @@ float3 ShadeSolid(float3 pos, float3 sunColor, float3 diffuseColor, float3 specu
 	if(selectEnvCube != NEAR_ENV_MAP)
 		eis = SampleEnvironmentIrradianceApprox(pos, cloudShadowAO.x, cloudShadowAO.y);
 
-	return ShadeSolid(eis, sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, selectEnvCube, lerpEnvCubeFactor, useSSLR, uvSSLR, insideCockpit, bentNormal);
+	return ShadeSolid(eis, sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, selectEnvCube, lerpEnvCubeFactor, useSSLR, uvSSLR, insideCockpit, bakedAO);
 }
 
-float3 ShadeHDR(uint2 sv_pos_xy, float3 sunColor, float3 diffuse, float3 normal, float roughness, float metallic, float3 emissive, float shadow, float AO, float2 cloudShadowAO, float3 viewDir, float3 pos, float2 energyLobe = {1,1}, uniform uint selectEnvCube = LERP_ENV_MAP, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), uniform uint LightsList = LL_SOLID, uniform bool insideCockpit = false, uniform bool useSecondaryShadowmap = false, float3 bentNormal = float3(0,0,0))
+float3 ShadeHDR(uint2 sv_pos_xy, float3 sunColor, float3 diffuse,
+	float3 normal, float roughness, float metallic, float3 emissive,
+	float shadow, float AO, float2 cloudShadowAO, float3 viewDir,
+	float3 pos, float2 energyLobe = {1,1},
+	uniform uint selectEnvCube = LERP_ENV_MAP,
+	uniform bool useSSLR = false,
+	float2 uvSSLR = float2(0, 0),
+	uniform uint LightsList = LL_SOLID,
+	uniform bool insideCockpit = false,
+	uniform bool useSecondaryShadowmap = false,
+	float bakedAO = 1.0)
 {
 	float3 baseColor = GammaToLinearSpace(diffuse);
 
@@ -287,7 +332,7 @@ float3 ShadeHDR(uint2 sv_pos_xy, float3 sunColor, float3 diffuse, float3 normal,
 
 	float lerpEnvCubeFactor = selectEnvCube == LERP_ENV_MAP ? exp(-distance(pos, gCameraPos)*(1.0 / 500.0)) : 0;
 
-	float3 finalColor = ShadeSolid(pos, sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, AO, cloudShadowAO, viewDir, energyLobe, selectEnvCube, lerpEnvCubeFactor, useSSLR, uvSSLR, insideCockpit, bentNormal);
+	float3 finalColor = ShadeSolid(pos, sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, AO, cloudShadowAO, viewDir, energyLobe, selectEnvCube, lerpEnvCubeFactor, useSSLR, uvSSLR, insideCockpit, bakedAO);
 
 	finalColor += CalculateDynamicLightingTiled(sv_pos_xy, diffuseColor, specularColor, roughness, normal, viewDir, pos, insideCockpit, energyLobe, 0, LightsList, true, useSecondaryShadowmap);
 
