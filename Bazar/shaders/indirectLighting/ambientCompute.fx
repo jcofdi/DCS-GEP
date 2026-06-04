@@ -3,6 +3,7 @@
 #include "common/context.hlsl"
 #include "enlight/atmDefinitions.hlsl"
 #include "enlight/atmFunctionsCommon.hlsl"
+#include "indirectLighting/importanceSampling.hlsl" // [MOD] FIX #13 — cosine-sampled ambient cube
 
 #ifdef USE_DCS_DEFERRED
 static const float3 minAmbient = float3(9, 26, 52) / 255.f * 0.25;
@@ -140,9 +141,38 @@ float3 SampleWhitePoint(float3 averageCube, bool bOutdoor)
 void BuildAmbientCube(uint id: SV_GroupIndex, uniform uint samplesPerWall, uniform bool bOutdoor)
 {
 #ifdef EDGE
+	// [MOD] FIX #13 — Cosine importance-sampled ambient cube faces.
+	//
+	// Stock EDGE path: single envCube.SampleLevel(normal, 8.0) — a GGX-prefiltered
+	// mip 8 point sample that averages the entire face, conflating sky and ground
+	// into one sky-dominated value for side walls.
+	//
+	// Replacement: 32 cosine importance-sampled directions at mip 4, giving a
+	// proper cosine-weighted irradiance integral per face. Cosine weighting
+	// emphasizes directions near the face normal and de-emphasizes face edges
+	// where the opposing hemisphere bleeds in. Runs once per frame in compute.
+	//
+	// Face 3 (bottom) is placeholder — overwritten by UpdateAmbientCubeBottomWall.
 	float3 clr;
-	if(id==3) clr = SampleEnvironmentCube(2, samplesPerWall, bOutdoor)*0.7;
-	else	  clr = SampleEnvironmentCube(id, samplesPerWall, bOutdoor);
+	if (id == 3)
+	{
+		clr = SampleEnvironmentCube(2, samplesPerWall, bOutdoor) * 0.7;
+	}
+	else
+	{
+		float3 N = normals[id];
+		float3 result = 0;
+		const uint cosinesamples = 32;
+
+		[loop]
+		for (uint i = 0; i < cosinesamples; ++i)
+		{
+			float2 E = hammersley(i, cosinesamples);
+			float3 L = importanceSampleCosine(E, N);
+			result += envCube.SampleLevel(ClampLinearSampler, L, 4.0).rgb;
+		}
+		clr = result / float(cosinesamples);
+	}
 #else
 	float3 clr = SampleEnvironmentCube(id, samplesPerWall, bOutdoor);
 #endif
@@ -204,90 +234,27 @@ void GetSurfaceColor(uniform uint samples)
 [numthreads(1,1,1)]
 void UpdateAmbientCubeBottomWall()
 {
-	const float3 averageHorizon = cubeWalls[6].rgb;
-	
-	const float heightCoef = pow(saturate(heightRelative + 0.062), 0.55); //нормализованая высота над поверхностью + минимальное смешивание с цветом горизонта
+	// Interpolate terrain color — dParam provides temporal smoothing
+	tmpValues[0].surfAmbient = lerp(tmpValues[0].surfaceColorLast,
+	                                tmpValues[0].surfaceColorNew,
+	                                saturate(dParam));
 
-	//интерполируем цвет эмбиента
-	tmpValues[0].surfAmbient = lerp(tmpValues[0].surfaceColorLast, tmpValues[0].surfaceColorNew, saturate(dParam));
+	// [MOD] FIX #11 — Use engine terrain render as bottom wall source.
+	//
+	// The engine renders a dedicated downward-looking view into a 2D texture
+	// each frame, capturing actual terrain color, cloud tops when above cloud
+	// layers, and atmospheric effects. This data is temporally smoothed via
+	// dParam interpolation between surfaceColorLast and surfaceColorNew.
+	//
+	// Stock behavior discarded this data at altitude, replacing it with
+	// averageHorizon * 0.7 via a heightCoef blend. Testing confirmed that
+	// the terrain render correctly captures cloud tops at 16,000+ ft and
+	// responds spatially to individual cloud formations below the camera.
+	// Verified functional through 60,000 ft.
+	cubeWalls[3].rgb = tmpValues[0].surfAmbient.rgb;
 
-	// [MOD] Cloud-occluded ground bounce: conservatively attenuate intensity
-	// and desaturate terrain color based on overhead cloud cover.
-	//
-	// PHYSICAL BASIS:
-	// Ground bounce = (light reaching ground) * (ground albedo) * (upward hemisphere).
-	// Under overcast, the cloud layer blocks direct sun and reduces diffuse
-	// skylight to ~20-30% of clear-sky levels. The ground can only reflect
-	// upward what it actually receives, so bounce intensity must decrease.
-	//
-	// Additionally, cloud-diffused illumination is spectrally flatter than
-	// direct sun + Rayleigh sky. The cloud layer acts as a massive scattering
-	// diffuser that homogenizes the incident spectrum. Ground receives grayer
-	// light, so its reflected bounce is less chromatic regardless of surface
-	// material color.
-	//
-	// DOUBLE-COUNTING MITIGATION:
-	// The terrain render texture (tex) is a C++ engine-rendered view that
-	// likely already includes some cloud shadow darkening in its lighting.
-	// Applying cloudAO.y as a raw multiplier would partially double-count
-	// this reduction. We use lerp(1.0, cloudAO.y, 0.6) to apply only 60%
-	// of the theoretical reduction, hedging against the portion the terrain
-	// render already captured.
-	//
-	// FACE ASYMMETRY FIX:
-	// BuildAmbientCube desaturates side walls (id 0,1,4,5) by ~60% via
-	// lerp(..., 0.4, isSide), but the bottom wall (id=3, isSideWall=0)
-	// receives zero desaturation then gets overwritten here with raw terrain
-	// color. This asymmetry makes terrain chrominance disproportionately
-	// strong on object undersides. Cloud-proportional desaturation corrects
-	// this under overcast while preserving legitimate color on clear days.
-	//
-	// SAFETY:
-	// cloudAO.y is clamped to minimum 0.3 — this serves dual purpose:
-	// physical floor (heaviest overcast still admits ~25-30% diffuse light)
-	// and robustness (if cloud shadow textures are not bound for this pass,
-	// D3D11 unbound SRV reads return 0; clamp prevents total ground bounce
-	// elimination).
-
-	// Sample cloud AO over a spatially stable area beneath camera.
-	// 5 Poisson samples at 8km radius for smooth, jitter-free average.
-	const float sampleRadius = 8000.0;
-	float2 cloudAO = 0;
-	for(uint ci = 0; ci < 5; ++ci)
-	{
-		cloudAO += SampleShadowClouds(
-			gCameraPos.xyz + float3(
-				Poisson25[ci].x * sampleRadius,
-				-500.0,
-				Poisson25[ci].y * sampleRadius));
-	}
-	cloudAO /= 5.0;
-	
-	// Sky visibility: 1.0 = clear, 0.2-0.3 = heavy overcast.
-	// Clamp to 0.3 minimum for physical floor + texture binding safety.
-	float groundIllumination = max(0.3, cloudAO.y);
-	
-	// Conservative intensity attenuation — apply 60% of theoretical
-	// reduction to account for partial double-counting with terrain render.
-	// Clear sky: factor = 1.0 (no change). Heavy overcast: factor ~0.58.
-	float intensityFactor = lerp(1.0, groundIllumination, 0.6);
-	float3 surfColor = tmpValues[0].surfAmbient.rgb * intensityFactor;
-	
-	// Desaturate proportional to cloud cover.
-	// Cloud cover metric: 0 = clear (no desaturation), 1 = full overcast.
-	float cloudCover = 1.0 - saturate(groundIllumination);
-	float desatAmount = cloudCover * 0.4; // Up to 40% desaturation at max overcast
-	float surfLum = dot(surfColor, float3(0.2126, 0.7152, 0.0722));
-	surfColor = lerp(surfColor, surfLum, desatAmount);
-
-#ifdef USE_DCS_DEFERRED
-	cubeWalls[3].rgb = lerp(surfColor, averageHorizon*0.7, heightCoef);
-#else
-	//убираем влияние цвета земли с увеличением высоты, дополнительно затемняем землю, таки это не зеркало
-	cubeWalls[3].rgb = lerp(surfColor*0.6, averageHorizon*0.7, heightCoef);
-#endif
-
-	cubeWalls[7].rgb = (cubeWalls[0].rgb + cubeWalls[1].rgb + cubeWalls[2].rgb + cubeWalls[3].rgb + cubeWalls[4].rgb + cubeWalls[5].rgb) / 6.0;
+	cubeWalls[7].rgb = (cubeWalls[0].rgb + cubeWalls[1].rgb + cubeWalls[2].rgb +
+	                    cubeWalls[3].rgb + cubeWalls[4].rgb + cubeWalls[5].rgb) / 6.0;
 }
 
 technique10 ambientCubeTech
