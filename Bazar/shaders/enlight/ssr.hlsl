@@ -104,23 +104,25 @@
 	}
 
 	float rand(float3 vsPos) {
-		// Interleaved Gradient Noise (Jimenez 2014). Derive screen-space pixel
-		// coordinates from the view-space position via projection so that
-		// adjacent pixels get properly decorrelated noise even on flat surfaces
-		// where the reflection direction barely changes between neighbors.
 		float4 proj = mul(float4(vsPos, 1), gProj);
 		float2 screenPix = float2(proj.x, -proj.y) / proj.w * 0.5 + 0.5;
-		screenPix *= 2048.0;
+		screenPix *= gSreenParams.xy;
 	#ifdef SSR_STATIC_NOISE
-		// Model path: no temporal accumulation available, so static noise
-		// prevents per-frame sparkle. The csFilterMip spatial blur averages
-		// over the fixed per-pixel offsets to produce a clean result.
-		return interleavedGradientNoise(screenPix, 0.0);
+		// Model path: no temporal accumulation. Blue noise gives the
+		// best perceptual quality for a single static frame -- energy
+		// concentrated in high spatial frequencies where the human
+		// visual system is least sensitive.
+		return ditherBlueNoiseComputed(uint2(screenPix));
 	#else
-		// Water path: temporal accumulation via mixPrevFrame() consumes the
-		// per-frame variation. Golden-ratio offset decorrelates each frame's
-		// pattern for optimal convergence over ~10 frames.
-		return interleavedGradientNoise(screenPix, gModelTime);
+		// Water path: temporal accumulation via mixPrevFrame() averages
+		// ~10 frames. IGN with golden-ratio offset is optimized for
+		// temporal convergence -- each frame's pattern is maximally
+		// decorrelated from the previous for fastest averaging.
+		float ign = frac(52.9829189 * frac(
+			dot(screenPix, float2(0.06711056, 0.00583715))
+		));
+		float framePhase = frac(gModelTime * 7.23);
+		return frac(ign + framePhase * 0.6180339887);
 	#endif
 	}
 	
