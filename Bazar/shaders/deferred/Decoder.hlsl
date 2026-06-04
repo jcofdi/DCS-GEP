@@ -8,7 +8,7 @@
 #include "deferred/packColor.hlsl"
 #include "deferred/packFloat.hlsl"
 
-TEXTURE_2D_ARRAY(float2, GBufferMap);
+TEXTURE_2D_ARRAY(float4, GBufferMap);
 TEXTURE_2D(float, DepthMap);
 TEXTURE_2D(uint2, StencilMap);
 #ifdef SEPARATE_NORMALS
