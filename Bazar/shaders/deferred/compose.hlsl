@@ -626,6 +626,7 @@ float3 ComposeTerrainSample(ComposerInput i, uint idx, uniform bool useShadows, 
 #endif
 }
 
+//GEP Note - VV OceanMod lines brought in for this version 
 float3 ComposeWaterSample(ComposerInput i, uint idx, uniform bool useShadows, uniform bool useBlurFlatShadows, uniform bool discardInsideFog = false, uniform bool bMSAA_Edge=false, uniform int mode = 0)
 {
 #if !defined(DISABLE_WATER_SHADING) && 1
