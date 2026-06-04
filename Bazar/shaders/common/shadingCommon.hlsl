@@ -81,7 +81,7 @@ float3 EnvBRDF(float3 specularColor, float roughness, float metallic, float3 nor
 	float VoH = max(0.0001, dot(viewDir, H));
 
 #if CALCULATE_ENV_BRDF
-	float vis = Visibility_smith(roughness, NoV, NoL);
+	float vis = Visibility_smithGGX(roughness, NoV, NoL);
 	return Fresnel_schlick(specularColor, VoH) * ( NoL * vis * (4 * VoH / NoH) );
 #else
 	float2 GF = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, NoV), 0);
@@ -101,41 +101,6 @@ float3 EnvBRDFApprox(float3 specularColor, float roughness, float NoV) {
 float3 EnvBRDFApprox(float3 specularColor, float roughness, float3 normal, float3 viewDir) {
 	float NoV = max(0, dot(normal, viewDir));
 	return EnvBRDFApprox(specularColor, roughness, NoV);
-}
-
-// ---------------------------------------------------------------------------
-// Multiscatter energy compensation (Kulla & Conty 2017, Filament formulation).
-//
-// Single-scattering GGX discards light that bounces between microfacets.
-// At roughness 1.0 with f0 = 1.0, ~60% of energy is lost.
-// This function returns a per-channel multiplier that recovers the lost
-// energy for the specular lobe.
-//
-// The compensation is derived from the preintegrated BRDF LUT at
-// register(t117): Ess = GF.x + GF.y is the total hemispherical
-// single-scatter reflectance at f0 = 1. The ratio 1/Ess - 1 represents
-// how much energy was lost relative to what was captured. Scaling by
-// specularColor (f0) accounts for absorption on each additional bounce;
-// colored metals gain both brightness and saturation, which is
-// physically correct.
-//
-// Reference:
-//   Kulla, Conty. "Revisiting Physically Based Shading at Imageworks."
-//     SIGGRAPH 2017 PBS Course.
-//   Filament documentation, §4.7.2 "Energy loss in specular reflectance."
-//     https://google.github.io/filament/Filament.md.html
-// ---------------------------------------------------------------------------
-float3 SpecularEnergyCompensation(float3 specularColor, float roughness, float NoV)
-{
-	// Single-scatter albedo from the preintegrated BRDF LUT.
-	// Ess = GF.x + GF.y = total hemispherical reflectance for f0=1.
-	float2 GF = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, NoV), 0);
-	float Ess = GF.x + GF.y;
-
-	// Filament formula: 1 + f0 * (1/Ess - 1)
-	// At low roughness Ess ≈ 1 → compensation ≈ 1 (no change).
-	// At high roughness Ess shrinks → compensation grows.
-	return 1.0 + specularColor * (1.0 / max(Ess, 0.001) - 1.0);
 }
 
 #endif
