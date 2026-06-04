@@ -45,7 +45,7 @@ float3 ShadeSolidCockpitGI(float3 sunColor, float3 diffuseColor, float3 specular
 
 	// Suppress GTAO convex-surface artifacts at grazing for diffuse IBL.
 	float3 gnFade = dot(geoNormal, geoNormal) > 0.5 ? geoNormal : normal;
-	float novFade = smoothstep(0.1, 0.4, dot(geoNormal, viewDir));
+	float novFade = smoothstep(0.1, 0.4, dot(gnFade, viewDir));
 	float fadedAO = lerp(bakedAO, AO, novFade);
 
 	// Hill-corrected multi-scatter energy (see ShadeSolid for derivation)
@@ -158,7 +158,7 @@ float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularCo
 
 	// Grazing-angle AO fade
 	float3 gnFade = dot(geoNormal, geoNormal) > 0.5 ? geoNormal : normal;
-	float novFade = smoothstep(0.1, 0.4, dot(geoNormal, viewDir));
+	float novFade = smoothstep(0.1, 0.4, dot(gnFade, viewDir));
 	float fadedAO = lerp(bakedAO, AO, novFade);
 
 
