@@ -136,10 +136,11 @@ float3 BlendSSLR(float3 envLightSpecular, float2 uvSSLR, float roughnessMip, flo
 	return lerp(envLightSpecular, sslr.rgb, sslr.a);
 }
 
-float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1, 1), uniform uint selectEnvCube = LERP_ENV_MAP, float lerpEnvCubeFactor = 0, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), uniform bool insideCockpit = false, float bakedAO = 1.0)
+float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1, 1), uniform uint selectEnvCube = LERP_ENV_MAP, float lerpEnvCubeFactor = 0, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), uniform bool insideCockpit = false, float bakedAO = 1.0, float3 geoNormal = float3(0,0,0))
 {
 
 	// Suppress GTAO convex-surface artifacts at grazing for diffuse IBL.
+	float3 gnFade = dot(geoNormal, geoNormal) > 0.5 ? geoNormal : normal;
 	float novFade = smoothstep(0.1, 0.4, dot(geoNormal, viewDir));
 	float fadedAO = lerp(bakedAO, AO, novFade);
 
@@ -215,14 +216,7 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 		envLightDiffuse = SampleEnvironmentMap(eis, normal, 1.0, environmentMipsCount, selectEnvCube, lerpEnvCubeFactor);
 	}
 	
-	float3 mbAO = MultiBounceAO(iblAO, diffuseColor);
-	// Gate multi-bounce lift by hemisphere visibility. At low AO,
-	// minimal light enters the cavity to inter-reflect — the bounce
-	// model overestimates energy retention in open cavities where
-	// most reflected light escapes through the opening.
-	float diffMBBlend = smoothstep(0.05, 0.4, iblAO);
-	mbAO = lerp(iblAO, mbAO, diffMBBlend);
-	finalColor += (FmsEms + kD) * envLightDiffuse * (gIBLIntensity * mbAO * energyLobe.x);
+	finalColor += (FmsEms + kD) * envLightDiffuse * (gIBLIntensity * iblAO * energyLobe.x);
 
 	// Specular IBL
 	float a = roughness * roughness;
@@ -297,7 +291,7 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 	return finalColor;
 }
 
-float3 ShadeSolid(float3 pos, float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float AO, float2 cloudShadowAO, float3 viewDir, float2 energyLobe = float2(1,1), uniform uint selectEnvCube = LERP_ENV_MAP, float lerpEnvCubeFactor = 0, uniform bool useSSLR = false, float2 uvSSLR =  float2(0,0), uniform bool insideCockpit = false, float bakedAO = 1.0)
+float3 ShadeSolid(float3 pos, float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float AO, float2 cloudShadowAO, float3 viewDir, float2 energyLobe = float2(1,1), uniform uint selectEnvCube = LERP_ENV_MAP, float lerpEnvCubeFactor = 0, uniform bool useSSLR = false, float2 uvSSLR =  float2(0,0), uniform bool insideCockpit = false, float bakedAO = 1.0, float3 geoNormal = float3(0,0,0))
 {
 #if	USE_DEBUG_ROUGHNESS_METALLIC
 	roughness = clamp(roughness + gDev0.z, 0.02, 0.99);
@@ -308,7 +302,7 @@ float3 ShadeSolid(float3 pos, float3 sunColor, float3 diffuseColor, float3 specu
 	if(selectEnvCube != NEAR_ENV_MAP)
 		eis = SampleEnvironmentIrradianceApprox(pos, cloudShadowAO.x, cloudShadowAO.y);
 
-	return ShadeSolid(eis, sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, selectEnvCube, lerpEnvCubeFactor, useSSLR, uvSSLR, insideCockpit, bakedAO);
+	return ShadeSolid(eis, sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, selectEnvCube, lerpEnvCubeFactor, useSSLR, uvSSLR, insideCockpit, bakedAO, geoNormal);
 }
 
 float3 ShadeHDR(uint2 sv_pos_xy, float3 sunColor, float3 diffuse,
@@ -321,7 +315,8 @@ float3 ShadeHDR(uint2 sv_pos_xy, float3 sunColor, float3 diffuse,
 	uniform uint LightsList = LL_SOLID,
 	uniform bool insideCockpit = false,
 	uniform bool useSecondaryShadowmap = false,
-	float bakedAO = 1.0)
+	float bakedAO = 1.0, 
+	float3 geoNormal = float3(0,0,0))
 {
 	float3 baseColor = GammaToLinearSpace(diffuse);
 
@@ -332,7 +327,7 @@ float3 ShadeHDR(uint2 sv_pos_xy, float3 sunColor, float3 diffuse,
 
 	float lerpEnvCubeFactor = selectEnvCube == LERP_ENV_MAP ? exp(-distance(pos, gCameraPos)*(1.0 / 500.0)) : 0;
 
-	float3 finalColor = ShadeSolid(pos, sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, AO, cloudShadowAO, viewDir, energyLobe, selectEnvCube, lerpEnvCubeFactor, useSSLR, uvSSLR, insideCockpit, bakedAO);
+	float3 finalColor = ShadeSolid(pos, sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, AO, cloudShadowAO, viewDir, energyLobe, selectEnvCube, lerpEnvCubeFactor, useSSLR, uvSSLR, insideCockpit, bakedAO, geoNormal);
 
 	finalColor += CalculateDynamicLightingTiled(sv_pos_xy, diffuseColor, specularColor, roughness, normal, viewDir, pos, insideCockpit, energyLobe, 0, LightsList, true, useSecondaryShadowmap);
 
