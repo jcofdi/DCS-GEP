@@ -37,15 +37,14 @@ float3 getEnvLightColor(float3 normal, float roughness, uniform bool useSSLR, fl
 	return envLightColor;
 }
 
-float3 ShadeSolidCockpitGI(float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1,1), uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), float bakedAO = 1.0)
+float3 ShadeSolidCockpitGI(float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1,1), uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), float bakedAO = 1.0, float3 geoNormal = float3(0,0,0))
 {
-	bool hasBentNormal = dot(bentNormal, bentNormal) > 0.5;
-
 	float roughnessSun = modifyRoughnessByCloudShadow(roughness, cloudShadow);
 	float NoL = max(0, dot(normal, gSunDir));
 	float NoV = max(0, dot(normal, viewDir)) + 1e-5;
 
 	// Suppress GTAO convex-surface artifacts at grazing for diffuse IBL.
+	float3 gnFade = dot(geoNormal, geoNormal) > 0.5 ? geoNormal : normal;
 	float novFade = smoothstep(0.1, 0.4, dot(geoNormal, viewDir));
 	float fadedAO = lerp(bakedAO, AO, novFade);
 
@@ -95,10 +94,7 @@ float3 ShadeSolidCockpitGI(float3 sunColor, float3 diffuseColor, float3 specular
 	float3 envLightDiffuse = SampleCockpitEnvironmentMap(normal, roughness, environmentMipsCount) * gCockpitIBL.z;
 #endif
 
-	float3 mbAO = MultiBounceAO(iblAO, diffuseColor);
-	float diffMBBlend = smoothstep(0.15, 0.6, iblAO);
-	mbAO = lerp(iblAO, mbAO, diffMBBlend * 0.333);
-	finalColor += (FmsEms + kD) * envLightDiffuse * (indirectSunLightAO.a * mbAO);
+	finalColor += (FmsEms + kD) * envLightDiffuse * (indirectSunLightAO.a * iblAO);
 
 	//specular IBL
 	float a = roughness * roughness;
@@ -154,16 +150,17 @@ float3 ShadeSolidCockpitGI(float3 sunColor, float3 diffuseColor, float3 specular
 	return finalColor;
 }
 
-float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1, 1), uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), float bakedAO = 1.0) {
-
-	bool hasBentNormal = dot(bentNormal, bentNormal) > 0.5;
+float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1, 1), uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), float bakedAO = 1.0, float3 geoNormal = float3(0,0,0)) {
 
 	float roughnessSun = modifyRoughnessByCloudShadow(roughness, cloudShadow);
 	float NoL = max(0, dot(normal, gSunDir));
 	float NoV = max(0, dot(normal, viewDir)) + 1e-5;
 
-	// Grazing-angle AO fade (see ShadeSolid for full bent-normal variant)
-	float fadedAO = lerp(1.0, AO, smoothstep(0.1, 0.4, dot(normal, viewDir)));
+	// Grazing-angle AO fade
+	float3 gnFade = dot(geoNormal, geoNormal) > 0.5 ? geoNormal : normal;
+	float novFade = smoothstep(0.1, 0.4, dot(geoNormal, viewDir));
+	float fadedAO = lerp(bakedAO, AO, novFade);
+
 
 	// Hill-corrected multi-scatter energy (see ShadeSolid for derivation)
 	float2 GF_lut = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, NoV), 0);
@@ -215,10 +212,7 @@ float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularCo
 	float3 envLightDiffuse = SampleCockpitEnvironmentMap(normal, roughness, environmentMipsCount);
 #endif
 
-	float3 mbAO = MultiBounceAO(iblAO, diffuseColor);
-	float diffMBBlend = smoothstep(0.15, 0.6, iblAO);
-	mbAO = lerp(iblAO, mbAO, diffMBBlend * 0.333);
-	finalColor += (FmsEms + kD) * envLightDiffuse * (gIBLIntensity * mbAO * energyLobe.x);
+	finalColor += (FmsEms + kD) * envLightDiffuse * (gIBLIntensity * iblAO * energyLobe.x);
 
 	//specular IBL
 #if USE_COCKPIT_CUBEMAP
@@ -268,7 +262,7 @@ float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularCo
 // #define USE_VS_GI
 
 float3 ShadeCockpit(uint2 uv, uniform bool bApplyGI, float3 sunColor, float3 diffuse, float3 normal, float roughness, float metallic, float3 emissive, float shadow, float AO, float2 cloudShadowAO, float3 viewDir, float3 pos,
-					float2 energyLobe = float2(1,1), uniform bool bTransparent = false, float alpha = 1.0, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), float bakedAO = 1.0)
+					float2 energyLobe = float2(1,1), uniform bool bTransparent = false, float alpha = 1.0, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), float bakedAO = 1.0, float3 geoNormal = float3(0,0,0))
 {
 #if	USE_DEBUG_ROUGHNESS_METALLIC
 	roughness = clamp(roughness + gDev0.z, 0.02, 0.99);
@@ -289,10 +283,10 @@ float3 ShadeCockpit(uint2 uv, uniform bool bApplyGI, float3 sunColor, float3 dif
 
 #ifndef USE_VS_GI
 	if(bApplyGI)
-		finalColor = ShadeSolidCockpitGI(sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, useSSLR, uvSSLR, bakedAO);
+		finalColor = ShadeSolidCockpitGI(sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, useSSLR, uvSSLR, bakedAO, geoNormal);
 	else
 #endif
-		finalColor = ShadeSolidCockpit(sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, useSSLR, uvSSLR, bakedAO);
+		finalColor = ShadeSolidCockpit(sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, useSSLR, uvSSLR, bakedAO, geoNormal);
 
 	finalColor += CalculateDynamicLightingTiled(uv, diffuseColor, specularColor, roughness, normal, viewDir, pos, 1, float2(1, 1), 0, bTransparent ? LL_TRANSPARENT : LL_SOLID);
 
