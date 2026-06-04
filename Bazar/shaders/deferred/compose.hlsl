@@ -482,7 +482,7 @@ float3 ComposeSample(ComposerInput i, uint idx, uniform bool useShadows, uniform
 	float3 viewDir = normalize(gCameraPos.xyz - wPos);
 	// [MOD] Cloud shadow dims available sunlight directly.
 	float3 sunColor = SampleSunRadiance(wPos, gSunDir) * shadow.clouds.x;
-	float3 finalColor = ShadeHDR(uv, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, shadow.finalShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), LERP_ENV_MAP, useSSLR, uvSSLR, LL_SOLID, false, true, bakedAO);
+	float3 finalColor = ShadeHDR(uv, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, shadow.finalShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), LERP_ENV_MAP, useSSLR, uvSSLR, LL_SOLID, false, true, bakedAO, geoNormal);
 
 	return finalColor;
 #endif
