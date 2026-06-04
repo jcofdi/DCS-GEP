@@ -1,4 +1,3 @@
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // GTAO-based Ambient Occlusion for DCS World
 //
 // Replaces the stock hemisphere SSAO with a horizon-based approach derived from:
@@ -8,63 +7,6 @@
 //
 // Reference implementation: Intel XeGTAO (MIT License)
 //   https://github.com/GameTechDev/XeGTAO
-//
-// Adapted to DCS's pixel shader pipeline. Uses the existing bilateral blur
-// passes and output format for full compatibility with compose.hlsl / SSAO.hlsl.
-//
-// Key differences from stock SSAO:
-//   - Horizon-based occlusion (analytic integration) instead of random hemisphere sampling
-//   - Far fewer samples needed for equivalent or better quality
-//   - Blue noise for per-pixel jitter (uses common/dithering.hlsl)
-//   - Physically-based cosine-weighted visibility instead of heuristic accumulation
-//   - Tunable cockpit vs external AO radius
-//
-// V2 changes:
-//   - Power curve moved from GTAO_Value to PS_BLUR (blur-then-contrast ordering).
-//   - DIST_FACTOR reduced from 4.0 to 3.0 (matches stock shadow width).
-//   - Minimum visibility raised from 0.03 to 0.08.
-//
-// V3 changes:
-//   - Noise decorrelation: separate seeds for slice rotation and step jitter.
-//   - Distance-adaptive screen radius cap (256px close, 128px far).
-//   - Power restored to 1.0 (analytically correct with V2 sample counts).
-//
-// V4 changes:
-//   - Sample counts rebalanced toward XeGTAO-validated operating point.
-//     SSAO_1: 3 slices x 4 steps = 24 reads (sparse, implicit thin tolerance)
-//     SSAO_2: 4 slices x 6 steps = 48 reads (dense, explicit thin compensation)
-//     Both tiers roughly halve V2's read count while improving thin-feature
-//     accuracy through the thickness heuristic. DCS's variable-pitch camera
-//     still benefits from more steps than Intel's 3-per-side default.
-//   - Thin occluder compensation (XeGTAO formulation). Inflates the Z component
-//     of the sample-to-center distance before falloff evaluation. Samples that
-//     are primarily "behind" the center pixel (thin features seen edge-on) are
-//     pushed toward the falloff boundary, reducing their horizon contribution.
-//     At SSAO_1's sparse 24 SPP, the heuristic fires on few samples and is
-//     effectively a no-op. At SSAO_2's 48 SPP, it meaningfully corrects the
-//     over-darkening from thin geometry (stabilizers, control surfaces, pylons).
-//   - Resolution-independent screen radius cap. All pixel-space limits are
-//     authored at 2560px width (1440p reference) and scale proportionally
-//     with viewport width, so the effective world-space search radius is
-//     consistent across 1080p, 1440p, 4K, and 5K.
-//   - Close-range cap raised to 384px (at reference resolution) to capture
-//     engine inlets, wheel wells, and wing-root junctions at inspection
-//     distance. Transition band starts at 5m for earlier engagement.
-//   - Power curve requires retuning for the new sample counts. The reduced
-//     SPP produces lighter raw visibility than V2/V3 (fewer horizon peaks
-//     found), and the thickness heuristic further lightens thin-feature
-//     contributions. A power above 1.0 restores contrast to match ground
-//     truth. Starting point: 1.4 (between Intel's 2.2 at 18 SPP and the
-//     previous 1.0 at 100 SPP).
-//
-// Performance comparison at 5K (~14.7M pixels), estimated:
-//   Stock SSAO_1:  64 scattered reads  ~ 4.0 ms
-//   Stock SSAO_2: 128 scattered reads  ~ 7.2 ms
-//   V2 SSAO_1:     64 structured reads ~ 2.8 ms
-//   V2 SSAO_2:    100 structured reads ~ 4.4 ms
-//   V4 SSAO_1:     24 structured reads ~ 1.1 ms
-//   V4 SSAO_2:     48 structured reads ~ 2.1 ms
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "common/samplers11.hlsl"
 #include "common/states11.hlsl"
@@ -80,38 +22,10 @@
 
 #define SIGMA (GAUSS_KERNEL - 1)*1.4
 
-// =============================================================================
 // Thin occluder compensation (XeGTAO formulation)
-// =============================================================================
-//
-// Screen-space AO treats every depth surface as an infinite half-plane
-// extending behind the visible face (the "height-field assumption"). A thin
-// feature like a stabilizer or control surface seen edge-on produces a large
-// depth delta that registers as a tall occluding wall, even though the actual
-// geometry is only centimeters thick.
-//
-// XeGTAO's heuristic: inflate the Z component of the sample-to-center
-// distance vector before computing the falloff weight. Samples that are
-// primarily "behind" the center pixel (large Z delta, small lateral delta)
-// appear virtually further away, pushing them toward the falloff boundary
-// and reducing their horizon contribution. Thick occluders with proportional
-// Z and lateral deltas are barely affected.
-//
-// The compensation value scales the Z inflation:
-//   0.0 = disabled (original behavior, all samples at geometric distance)
-//   0.3 = mild, attenuates only extreme thin-edge cases
-//   0.5 = moderate, recommended for 48 SPP with DCS geometry mix
-//   0.7 = XeGTAO maximum recommended, aggressive attenuation
-//
-// At SSAO_1's sparse 24 SPP, thin features are naturally missed between
-// steps, providing implicit tolerance. The heuristic is still compiled in
-// but has minimal effect at low sample density.
-//
-// Tuning: adjust in conjunction with the power curve. Increasing compensation
-// lightens raw visibility (fewer thin-feature peaks contribute), which may
-// require a slightly higher power to restore contrast on thick geometry.
-// =============================================================================
-static const float THIN_OCCLUDER_BETA = 0.02;
+static const float THIN_OCCLUDER_BETA = 0.00; //disabled for ground-truth testing
+// static const float THIN_OCCLUDER_BETA = 0.02; 
+
 
 float radius;
 uint4 viewport;
@@ -178,37 +92,28 @@ float2 octEncode(float3 n) {
 	return o;
 }
 
-//=============================================================================
 // GTAO Core - Horizon-Based Ambient Occlusion
-//=============================================================================
-//
-// For each pixel, we cast rays in several 2D screen-space directions ("slices").
-// Along each slice, we march outward in both directions and find the maximum
-// elevation angle (horizon) of the depth buffer relative to the view vector.
-// The visible portion of the hemisphere is the angular span NOT blocked by
-// these horizons, weighted by the surface normal's projected contribution.
-//
-// This is fundamentally different from the stock SSAO which randomly samples
-// points in a 3D hemisphere and tests binary occlusion. GTAO uses the 2D
-// slice structure to analytically integrate occlusion, making each sample
-// much more informative.
-//
-// CRITICAL: Horizon angles are computed using atan2 on the delta (Z vs lateral)
-// projected into the 2D slice plane, NOT via dot(delta, viewVec). This avoids
-// the sign ambiguity that caused the horizontal band artifact when the 3D
-// horizon vector's dot product with viewVec produced symmetric errors at
-// screen center.
-//=============================================================================
 
 float4 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SLICES, uniform int STEPS, uniform float DIST_FACTOR) {
 	
-	// Decode the surface normal from the GBuffer and transform to view space
+	// Decode the surface normal from the GBuffer and transform to view space.
+	// Depth-aware neighbor blending: average with 2x2 neighbors where depth
+	// is continuous, skip where a silhouette edge is detected. This removes
+	// per-pixel noise on flat surfaces while preserving accurate normals at
+	// object edges (where averaging would otherwise produce a "wrong" normal
+	// between two surface orientations and corrupt the slice integration).
 	float3 vNormal = DecodeNormal(pix, 0);
-	// Smooth normals: average with neighbors to reduce per-pixel noise
+	float centerDepth = vPos.z;
 	[unroll]
 	for (uint j = 1; j < 4; ++j) {
 		static const int2 offs[4] = { {0,0}, {0,1}, {1,1}, {1,0} };
-		vNormal += DecodeNormal(pix + offs[j], 0) * 0.9;
+		uint2 npix = pix + offs[j];
+		float nDepth = reconstructViewPos(npix).z;
+		// 5% relative threshold: within-surface depth variation (normal-map
+		// relief, subpixel geometry) stays below this; silhouettes and panel
+		// gaps exceed it. Scales automatically with distance.
+		float depthWeight = abs(nDepth - centerDepth) < (centerDepth * 0.05) ? 0.9 : 0.0;
+		vNormal += DecodeNormal(npix, 0) * depthWeight;
 	}
 	vNormal = mul(normalize(vNormal), (float3x3)gView);
 
@@ -230,29 +135,10 @@ float4 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SL
 
 	// Early out if the AO radius is smaller than ~1 pixel
 	if (screenRadius < 1.5)
-		return float4(1.0, vPos.z, octEncode(mul(vNormal, transpose((float3x3)gView))));
+		return float4(1.0, vPos.z, 0, 0);
 
 
 	// V4: Resolution-independent, distance-adaptive screen radius cap.
-	//
-	// All pixel limits are authored at 2560px reference width (1440p) and
-	// scale with actual viewport width. This ensures the effective
-	// world-space search radius is identical across resolutions: 1080p,
-	// 1440p, 4K, and 5K all search the same physical distance, just at
-	// different pixel granularity.
-	//
-	// Close range (< 5m): geometry is cache-coherent, allow 384px (ref)
-	// for engine inlets, wheel wells, and wing-root junctions.
-	// Far range (> 50m): depth discontinuities cause cache thrashing,
-	// keep conservative at 128px (ref).
-	//
-	// Cache coherence rationale: at close range, neighboring screen pixels
-	// map to nearby world-space positions with similar depths. The
-	// structured horizon march reads a coherent strip of the depth buffer
-	// where fetched cache blocks are reused by subsequent steps. At far
-	// range, a wide pixel march can cross depth discontinuities (aircraft
-	// silhouette against sky) where each step lands in a different memory
-	// region, thrashing the texture cache.
 	float resScale = viewport.z / 2560.0;
 	float maxScreenRadius = lerp(128.0, 384.0, exp(-vPos.z * 0.03)) * resScale;
 	screenRadius = min(screenRadius, maxScreenRadius);
@@ -261,23 +147,12 @@ float4 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SL
 	float minStep = 1.3 / screenRadius;
 
 	// Per-pixel noise for slice rotation and step jitter.
-	// CRITICAL: these must use different seeds. Identical seeds produce
-	// correlated slice angles and step offsets, creating structured banding
-	// that the bilateral blur cannot fully remove. Offset of 1.0 on the
-	// frame counter is sufficient since IGN is a spatial hash -- any
-	// distinct second argument produces a fully decorrelated pattern.
 	float2 pixelPos = float2(pix);
 	float noiseSlice  = ditherBlueNoiseComputed(uint2(pixelPos));
 	float noiseSample = ditherBlueNoiseComputed(uint2(pixelPos) + uint2(37, 17));
 
 	// Accumulate visibility across all slices
 	float visibility = 0;
-
-	// Bent normal accumulator (view space). Each slice contributes the
-	// centroid direction of its visible arc, weighted identically to the
-	// scalar visibility. The result is the average unoccluded direction,
-	// used downstream to redirect ambient lighting evaluation.
-	float3 bentNormal = 0;
 
 	// Slight bias: push the position along the normal to avoid self-occlusion
 	// artifacts (equivalent to the stock bias = vPos.z * 0.001)
@@ -400,60 +275,16 @@ float4 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SL
 		float adjProjNormLen = lerp(projNormLen, 1.0, 0.05);
 		float sliceWeight = adjProjNormLen * (iarc0 + iarc1);
 		visibility += sliceWeight;
-
-		// --- Bent normal: centroid of visible arc projected to 3D ---
-		// The midpoint of the clamped visible arc [h0, h1] is the best
-		// single-direction summary of where unoccluded light arrives from
-		// within this slice's 2D plane.
-		float bentAngle = (h0 + h1) * 0.5;
-
-		// Reconstruct 3D view-space direction from the 2D slice angle.
-		// orthoDir lies in the slice plane, perpendicular to viewVec.
-		float orthoLen = length(orthoDir);
-		float3 orthoNorm = orthoLen > 1e-6 ? orthoDir / orthoLen : directionVec;
-
-		float cosBent, sinBent;
-		sincos(bentAngle, sinBent, cosBent);
-		float3 sliceBentDir = viewVec * cosBent + orthoNorm * sinBent;
-
-		// Accumulate with the same weighting as scalar visibility so the
-		// bent direction and AO intensity are mutually consistent.
-		bentNormal += sliceBentDir * sliceWeight;
 	}
 
-	// Average over all slices
 	visibility /= float(SLICES);
 
-	// Finalize bent normal: average and normalize to unit length.
-	// When visibility is near-zero (deep crevice), the accumulated bent
-	// direction may be too short to normalize reliably. Fall back to the
-	// geometric normal in view space.
-	bentNormal /= float(SLICES);
-	float bentLen = length(bentNormal);
-	float3 finalBent = bentLen > 1e-4 ? bentNormal / bentLen : vNormal;
+visibility = max(0.08, visibility);
 
-	// Transform bent normal from view space to world space.
-	// gView's rotation submatrix is orthonormal, so inverse = transpose.
-	float3 bentWorld = mul(finalBent, transpose((float3x3)gView));
-
-	// Raw visibility output. No power curve here -- applied after blur in
-	// PS_BLUR. The bilateral blur operates on gentle gradient values where
-	// edge-aware averaging is effective.
-
-	// Minimum visibility floor. Prevents absolute black AO even in
-	// worst-case geometry (deep crevices, overlapping surfaces). At 0.08,
-	// the darkest possible AO still lets ~8% of the lit surface color
-	// through, which reads as deep shadow rather than a rendering error.
-	visibility = max(0.08, visibility);
-
-	// Pack: (visibility, viewDepth, bentOctahedral.x, bentOctahedral.y)
-	float2 bentOct = octEncode(bentWorld);
-	return float4(visibility, vPos.z, bentOct.x, bentOct.y);
+return float4(visibility, vPos.z, 0, 0);
 }
 
-//=============================================================================
 // Sampling entry point
-//=============================================================================
 
 float4 GTAOSample(const VS_OUTPUT i, uniform int SLICES, uniform int STEPS, uniform float DIST_FACTOR) {
 	float2 projXY = i.projPos.xy / i.projPos.w;
@@ -474,9 +305,7 @@ float4 GTAOSample(const VS_OUTPUT i, uniform int SLICES, uniform int STEPS, unif
 	return GTAO_Value(pix, vPos, isCockpit, SLICES, STEPS, DIST_FACTOR);
 }
 
-//=============================================================================
 // Bilateral blur (unchanged from stock -- proven edge-aware denoiser)
-//=============================================================================
 
 float gaussian_blur(float x, float s) {
 	return exp(-x*x / (2*s*s));
@@ -500,9 +329,7 @@ float joinedBilateralGaussianBlur(uint2 uv, uniform int GAUSS_KERNEL) {
 	return acc / aw;
 }
 
-//=============================================================================
 // Pixel shader outputs
-//=============================================================================
 
 struct PS_OUTPUT {
 	float4 ssao: SV_TARGET0;
@@ -549,37 +376,7 @@ float4 PS_BLUR(const VS_OUTPUT i, uniform int GAUSS_KERNEL): SV_TARGET0 {
 //    return float4(src.Load(uint3(i.pos.xy, 0)).x, 0, 0, 1); // to test unblurred output disable uncomment this and comment out above line
 }
 
-//=============================================================================
 // Technique -- same structure as stock so DCS's render graph is unchanged
-//=============================================================================
-//
-// V4: Sample counts rebalanced toward XeGTAO-validated operating point.
-//
-// SSAO_1: 3 slices x 4 steps = 24 reads
-//   Sparse sampling provides implicit thin-occluder tolerance: at 4 steps
-//   per side with quadratic distribution, thin features frequently fall
-//   between sample positions and are naturally missed. No explicit thickness
-//   heuristic needed (compiled in but effectively a no-op at this density).
-//   3 slices with IGN jitter and bilateral blur provide adequate angular
-//   coverage for DCS's variable camera pitch.
-//
-// SSAO_2: 4 slices x 6 steps = 48 reads
-//   Denser radial resolution captures deep concavities (engine inlets,
-//   wheel wells, wing-root junctions) that sparse SSAO_1 can miss. The
-//   extra steps also find more thin-feature horizon peaks, which the
-//   thickness heuristic correctly attenuates. 4 slices gives better
-//   angular diversity for DCS's extreme viewing angles (looking up at
-//   wing underside, down at ramp, across at formation).
-//
-// Both tiers use DIST_FACTOR 3.0 (matches stock shadow width) and share
-// the same bilateral blur passes and power curve.
-//
-// Performance at 1440p (estimated from bandwidth scaling):
-//   V4 SSAO_1:  24 reads ~ 0.3 ms
-//   V4 SSAO_2:  48 reads ~ 0.5 ms
-//   (V3 SSAO_1: 64 reads ~ 0.7 ms)
-//   (V3 SSAO_2: 100 reads ~ 1.1 ms)
-//=============================================================================
 
 #define COMMON_PART			SetVertexShader(CompileShader(vs_5_0, VS()));				\
 		SetGeometryShader(NULL);														\
@@ -590,7 +387,7 @@ float4 PS_BLUR(const VS_OUTPUT i, uniform int GAUSS_KERNEL): SV_TARGET0 {
 technique10 SSAO {
 	//                          Slices, Steps, DistFactor
 	pass SSAO_1	{
-		SetPixelShader(CompileShader(ps_5_0, PS(32, 32, 3.0)));
+		SetPixelShader(CompileShader(ps_5_0, PS(16, 32, 3.0)));
 		COMMON_PART
 	}
 	pass SSAO_2 {
