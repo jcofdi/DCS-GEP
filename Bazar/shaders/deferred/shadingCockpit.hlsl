@@ -37,12 +37,51 @@ float3 getEnvLightColor(float3 normal, float roughness, uniform bool useSSLR, fl
 	return envLightColor;
 }
 
-float3 ShadeSolidCockpitGI(float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1,1), uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0))
+float3 ShadeSolidCockpitGI(float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1,1), uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), float bakedAO = 1.0)
 {
+	bool hasBentNormal = dot(bentNormal, bentNormal) > 0.5;
+
 	float roughnessSun = modifyRoughnessByCloudShadow(roughness, cloudShadow);
 	float NoL = max(0, dot(normal, gSunDir));
-	float3 lightAmount = sunColor * (gSunIntensity * NoL * shadow);
-	float3 finalColor = ShadingDefault(diffuseColor, specularColor, roughnessSun, normal, viewDir, gSunDir, energyLobe) * lightAmount;
+	float NoV = max(0, dot(normal, viewDir)) + 1e-5;
+
+	// Suppress GTAO convex-surface artifacts at grazing for diffuse IBL.
+	float novFade = smoothstep(0.1, 0.4, dot(normal, viewDir));
+	float fadedAO = lerp(bakedAO, AO, novFade);
+
+	// Hill-corrected multi-scatter energy (see ShadeSolid for derivation)
+	float2 GF_lut = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, NoV), 0);
+	float Ess = GF_lut.x + GF_lut.y;
+	float3 Fss = specularColor * GF_lut.x + saturate(50.0 * specularColor.g) * GF_lut.y;
+	float2 GF_avg = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, 0.5), 0);
+	float Eavg = GF_avg.x + GF_avg.y;
+	float3 Favg = specularColor + (1.0 / 21.0) * (1.0 - specularColor);
+	float3 Fms = (Favg * Favg * Eavg) / max(1.0 - Favg * (1.0 - Eavg), 0.001);
+	float3 energyComp = 1.0 + Fms * (1.0 / max(Ess, 0.001) - 1.0);
+
+	// Fdez-Agüera (JCGT 2019): multi-scatter through irradiance
+	float3 FmsEms = Fms * (1.0 - Ess);
+	float3 specColor_ss = Fss;
+	float3 kD = diffuseColor * (1.0 - (Fss + FmsEms));
+
+	// Direct sun
+	float3 sunBRDF = EvaluateSunBRDF(diffuseColor, specularColor,
+		roughnessSun, normal, viewDir, NoL, NoV, energyLobe,
+		metallic, energyComp, cloudShadow);
+
+	// Baked AO micro-shadow on direct sun
+	float microShadow = 1.0;
+	if (bakedAO < 0.999) {
+		float cosConeAngle = sqrt(1.0 - bakedAO);
+		microShadow = saturate(NoL / max(cosConeAngle, 0.001));
+		microShadow *= microShadow;
+	}
+	float3 lightAmount = sunColor * (gSunIntensity * NoL
+		* min(shadow, microShadow));
+	float3 finalColor = sunBRDF * lightAmount;
+
+	// IBL AO
+	float iblAO = compensateAOForMissingBounce(fadedAO, shadow);
 
 	//sun IBL
 	//todo: умножение на sunColor унести в предрасчет
@@ -55,10 +94,13 @@ float3 ShadeSolidCockpitGI(float3 sunColor, float3 diffuseColor, float3 specular
 #else
 	float3 envLightDiffuse = SampleCockpitEnvironmentMap(normal, roughness, environmentMipsCount) * gCockpitIBL.z;
 #endif
-	finalColor += diffuseColor * envLightDiffuse * (indirectSunLightAO.a * AO);
+
+	float3 mbAO = MultiBounceAO(iblAO, diffuseColor);
+	float diffMBBlend = smoothstep(0.15, 0.6, iblAO);
+	mbAO = lerp(iblAO, mbAO, diffMBBlend * 0.333);
+	finalColor += (FmsEms + kD) * envLightDiffuse * (indirectSunLightAO.a * mbAO);
 
 	//specular IBL
-	float NoV = max(0, dot(normal, viewDir));
 	float a = roughness * roughness;
 	float3 R = normal*NoV*2 - viewDir;
 	R = normalize( lerp( normal, R, (1 - a) * ( sqrt(1 - a) + a ) ) );
@@ -86,28 +128,77 @@ float3 ShadeSolidCockpitGI(float3 sunColor, float3 diffuseColor, float3 specular
 		float3 envLightSpecular = getEnvLightColor(R, roughness, useSSLR, uvSSLR);
 	#endif
 #endif
-	
-#if	USE_BRDF_K
-	float3 specColor = EnvBRDFApproxK(specularColor, roughness, NoV, gDev1.w);
-#else
-	float3 specColor = EnvBRDFApprox(specularColor, roughness, NoV);
-#endif
-	specColor *= SpecularEnergyCompensation(specularColor, roughness, NoV);
 
-	finalColor += envLightSpecular * specColor * (energyLobe.y * indirectSunLightAO.a * AO);
-	// finalColor += envLightSpecular * EnvBRDF(specularColor, roughness, metallic, normal, viewDir, R) * (energyLobe.y * indirectSunLightAO.a * AO);
+	// Rim tinting (see ShadeSolid for derivation)
+	{
+		float rimTintWeight = saturate(roughness - 0.3) * saturate(pow(1.0 - NoV, 3) * 2.0);
+		float3 ambientTint = AmbientLight(R);
+		float ambientLum  = dot(ambientTint, float3(0.2126, 0.7152, 0.0722));
+		float specularLum = dot(envLightSpecular, float3(0.2126, 0.7152, 0.0722));
+
+		float3 specChroma    = envLightSpecular / max(specularLum, 0.001);
+		float3 ambientChroma = ambientTint / max(ambientLum, 0.001);
+		float3 blendedChroma = lerp(specChroma, ambientChroma, rimTintWeight);
+		envLightSpecular = blendedChroma * specularLum;
+	}
+
+	// LUT-calibrated specular occlusion (see ShadeSolid for derivation)
+	float specOcc = saturate(pow(NoV + fadedAO, Ess) - 1.0 + fadedAO);
+	specOcc = max(specOcc, 0.08);
+
+	float3 mbSpecOcc = MultiBounceSpecOcc(specOcc, specularColor);
+	float mbBlend = smoothstep(0.2, 0.5, fadedAO) * 0.333;
+	float3 finalSpecOcc = lerp(specOcc, mbSpecOcc, mbBlend);
+	finalColor += envLightSpecular * specColor_ss * (finalSpecOcc * indirectSunLightAO.a * energyLobe.y);
 
 	return finalColor;
 }
 
-float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1, 1), uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0)) {
+float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularColor, float3 normal, float roughness, float metallic, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = float2(1, 1), uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), float bakedAO = 1.0) {
+
+	bool hasBentNormal = dot(bentNormal, bentNormal) > 0.5;
 
 	float roughnessSun = modifyRoughnessByCloudShadow(roughness, cloudShadow);
 	float NoL = max(0, dot(normal, gSunDir));
-	float3 lightAmount = sunColor * (gSunIntensity * NoL * shadow);
-	float3 finalColor = ShadingDefault(diffuseColor, specularColor, roughnessSun, normal, viewDir, gSunDir, energyLobe) * lightAmount;
+	float NoV = max(0, dot(normal, viewDir)) + 1e-5;
 
-	float NoV = max(0, dot(normal, viewDir));
+	// Grazing-angle AO fade (see ShadeSolid for full bent-normal variant)
+	float fadedAO = lerp(1.0, AO, smoothstep(0.1, 0.4, dot(normal, viewDir)));
+
+	// Hill-corrected multi-scatter energy (see ShadeSolid for derivation)
+	float2 GF_lut = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, NoV), 0);
+	float Ess = GF_lut.x + GF_lut.y;
+	float3 Fss = specularColor * GF_lut.x + saturate(50.0 * specularColor.g) * GF_lut.y;
+	float2 GF_avg = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, 0.5), 0);
+	float Eavg = GF_avg.x + GF_avg.y;
+	float3 Favg = specularColor + (1.0 / 21.0) * (1.0 - specularColor);
+	float3 Fms = (Favg * Favg * Eavg) / max(1.0 - Favg * (1.0 - Eavg), 0.001);
+	float3 energyComp = 1.0 + Fms * (1.0 / max(Ess, 0.001) - 1.0);
+
+	// Fdez-Agüera (JCGT 2019): multi-scatter through irradiance
+	float3 FmsEms = Fms * (1.0 - Ess);
+	float3 specColor_ss = Fss;
+	float3 kD = diffuseColor * (1.0 - (Fss + FmsEms));
+
+	// Direct sun
+	float3 sunBRDF = EvaluateSunBRDF(diffuseColor, specularColor,
+		roughnessSun, normal, viewDir, NoL, NoV, energyLobe,
+		metallic, energyComp, cloudShadow);
+
+	// Baked AO micro-shadow on direct sun
+	float microShadow = 1.0;
+	if (bakedAO < 0.999) {
+		float cosConeAngle = sqrt(1.0 - bakedAO);
+		microShadow = saturate(NoL / max(cosConeAngle, 0.001));
+		microShadow *= microShadow;
+	}
+	float3 lightAmount = sunColor * (gSunIntensity * NoL
+		* min(shadow, microShadow));
+	float3 finalColor = sunBRDF * lightAmount;
+
+	// IBL AO
+	float iblAO = compensateAOForMissingBounce(fadedAO, shadow);
+
 	float a = roughness * roughness;
 	float3 R = normal * NoV * 2 - viewDir;
 	R = normalize(lerp(normal, R, (1 - a) * (sqrt(1 - a) + a)));
@@ -123,7 +214,11 @@ float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularCo
 #else
 	float3 envLightDiffuse = SampleCockpitEnvironmentMap(normal, roughness, environmentMipsCount);
 #endif
-	finalColor += diffuseColor * envLightDiffuse * (gIBLIntensity * AO);
+
+	float3 mbAO = MultiBounceAO(iblAO, diffuseColor);
+	float diffMBBlend = smoothstep(0.15, 0.6, iblAO);
+	mbAO = lerp(iblAO, mbAO, diffMBBlend * 0.333);
+	finalColor += (FmsEms + kD) * envLightDiffuse * (gIBLIntensity * mbAO * energyLobe.x);
 
 	//specular IBL
 #if USE_COCKPIT_CUBEMAP
@@ -145,14 +240,27 @@ float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularCo
 	float3 envLightSpecular = getEnvLightColor(R, roughness, useSSLR, uvSSLR);
 #endif
 
-#if	USE_BRDF_K
-	float3 specColor = EnvBRDFApproxK(specularColor, roughness, NoV, gDev1.w);
-#else
-	float3 specColor = EnvBRDFApprox(specularColor, roughness, NoV);
-#endif
-	specColor *= SpecularEnergyCompensation(specularColor, roughness, NoV);	
+	// Rim tinting (see ShadeSolid for derivation)
+	{
+		float rimTintWeight = saturate(roughness - 0.3) * saturate(pow(1.0 - NoV, 3) * 2.0);
+		float3 ambientTint = AmbientLight(R);
+		float ambientLum  = dot(ambientTint, float3(0.2126, 0.7152, 0.0722));
+		float specularLum = dot(envLightSpecular, float3(0.2126, 0.7152, 0.0722));
 
-	finalColor += envLightSpecular * specColor * (energyLobe.y * AO);
+		float3 specChroma    = envLightSpecular / max(specularLum, 0.001);
+		float3 ambientChroma = ambientTint / max(ambientLum, 0.001);
+		float3 blendedChroma = lerp(specChroma, ambientChroma, rimTintWeight);
+		envLightSpecular = blendedChroma * specularLum;
+	}
+
+	// LUT-calibrated specular occlusion (see ShadeSolid for derivation)
+	float specOcc = saturate(pow(NoV + fadedAO, Ess) - 1.0 + fadedAO);
+	specOcc = max(specOcc, 0.08);
+
+	float3 mbSpecOcc = MultiBounceSpecOcc(specOcc, specularColor);
+	float mbBlend = smoothstep(0.2, 0.5, fadedAO) * 0.333;
+	float3 finalSpecOcc = lerp(specOcc, mbSpecOcc, mbBlend);
+	finalColor += envLightSpecular * specColor_ss * (finalSpecOcc * energyLobe.y);
 
 	return finalColor;
 }
@@ -160,7 +268,7 @@ float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularCo
 // #define USE_VS_GI
 
 float3 ShadeCockpit(uint2 uv, uniform bool bApplyGI, float3 sunColor, float3 diffuse, float3 normal, float roughness, float metallic, float3 emissive, float shadow, float AO, float2 cloudShadowAO, float3 viewDir, float3 pos,
-					float2 energyLobe = float2(1,1), uniform bool bTransparent = false, float alpha = 1.0, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0))
+					float2 energyLobe = float2(1,1), uniform bool bTransparent = false, float alpha = 1.0, uniform bool useSSLR = false, float2 uvSSLR = float2(0, 0), float bakedAO = 1.0)
 {
 #if	USE_DEBUG_ROUGHNESS_METALLIC
 	roughness = clamp(roughness + gDev0.z, 0.02, 0.99);
@@ -170,7 +278,7 @@ float3 ShadeCockpit(uint2 uv, uniform bool bApplyGI, float3 sunColor, float3 dif
 	float3 baseColor = GammaToLinearSpace(diffuse);
 
 	float3 diffuseColor = baseColor * (1.0 - metallic);
-	float3 specularColor = lerp(bApplyGI ? 0.03 : 0.02, baseColor, metallic);
+	float3 specularColor = lerp(bApplyGI ? 0.035 : 0.03, baseColor, metallic);
 
 	roughness = clamp(roughness, 0.02, 0.99);
 
@@ -181,12 +289,12 @@ float3 ShadeCockpit(uint2 uv, uniform bool bApplyGI, float3 sunColor, float3 dif
 
 #ifndef USE_VS_GI
 	if(bApplyGI)
-		finalColor = ShadeSolidCockpitGI(sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, useSSLR, uvSSLR);
+		finalColor = ShadeSolidCockpitGI(sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, useSSLR, uvSSLR, bakedAO);
 	else
 #endif
-		finalColor = ShadeSolidCockpit(sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, useSSLR, uvSSLR);
+		finalColor = ShadeSolidCockpit(sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadowAO.x, AO, viewDir, pos, energyLobe, useSSLR, uvSSLR, bakedAO);
 
-	finalColor += CalculateDynamicLightingTiled(uv, diffuseColor, specularColor, roughness, normal, viewDir, pos, 1);
+	finalColor += CalculateDynamicLightingTiled(uv, diffuseColor, specularColor, roughness, normal, viewDir, pos, 1, float2(1, 1), 0, bTransparent ? LL_TRANSPARENT : LL_SOLID);
 
 #ifndef USE_VS_GI
 	finalColor += emissive;
