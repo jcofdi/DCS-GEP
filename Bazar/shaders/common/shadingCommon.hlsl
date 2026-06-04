@@ -64,7 +64,7 @@ float3 ShadingDefault(float3 diffuseColor, float3 specularColor, float roughness
 	float Fd = Diffuse_Frostbite(NoV, NoL, LdotH, roughness);
 	float3 diffuse = diffuseColor * Fd * (1.0 / 3.1415926535897932);
 
-	float3 brdf = Fresnel_schlick(specularColor, VoH) * ( D_ggx(roughness, NoH) * Visibility_smithJA(roughness, NoV, NoL) );
+	float3 brdf = Fresnel_schlick(specularColor, VoH) * ( D_ggx(roughness, NoH) * Visibility_smithGGX(roughness, NoV, NoL) );
 	// float brdf = D_ggx(roughness, NoH) * Fresnel_schlick(specularColor, VoH) * Visibility_implicit();
 	//float3 brdf = D_blinn(roughness, NoH) * Fresnel_schlick(specularColor, VoH) * Visibility_smith(roughness, NoV, NoL);
 	// float brdf =  D_blinn(roughness, NoH) * Fresnel_schlick(specularColor, VoH) * Visibility_neumann(NoV, NoL);	
@@ -111,12 +111,13 @@ float3 EnvBRDFApprox(float3 specularColor, float roughness, float3 normal, float
 // This function returns a per-channel multiplier that recovers the lost
 // energy for the specular lobe.
 //
-// The compensation is derived from the same polynomial that EnvBRDFApprox
-// uses: GF.y is the view-dependent single-scatter albedo at f0 = 0 (the
-// "bias" term). The ratio 1/GF.y - 1 represents how much energy was lost
-// relative to what was captured. Scaling by specularColor (f0) accounts
-// for absorption on each additional bounce, colored metals gain both
-// brightness and saturation, which is physically correct.
+// The compensation is derived from the preintegrated BRDF LUT at
+// register(t117): Ess = GF.x + GF.y is the total hemispherical
+// single-scatter reflectance at f0 = 1. The ratio 1/Ess - 1 represents
+// how much energy was lost relative to what was captured. Scaling by
+// specularColor (f0) accounts for absorption on each additional bounce;
+// colored metals gain both brightness and saturation, which is
+// physically correct.
 //
 // Reference:
 //   Kulla, Conty. "Revisiting Physically Based Shading at Imageworks."
@@ -126,19 +127,14 @@ float3 EnvBRDFApprox(float3 specularColor, float roughness, float3 normal, float
 // ---------------------------------------------------------------------------
 float3 SpecularEnergyCompensation(float3 specularColor, float roughness, float NoV)
 {
-	// Recompute the GF bias term from the same Karis polynomial used by
-	// EnvBRDFApprox. This avoids modifying EnvBRDFApprox's signature.
-	const float4 c0 = { -1, -0.0275, -0.572, 0.022 };
-	const float4 c1 = { 1, 0.0425, 1.04, -0.04 };
-	float4 r = roughness * c0 + c1;
-	float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
-	float2 GF = float2(-1.04, 1.04) * a004 + r.zw; // GF.y - the f0-independent term
+	// Single-scatter albedo from the preintegrated BRDF LUT.
+	// Ess = GF.x + GF.y = total hemispherical reflectance for f0=1.
+	float2 GF = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, NoV), 0);
 	float Ess = GF.x + GF.y;
 
-	// Filament formula: 1 + f0 * (1/bias - 1)
-	// At low roughness bias ≈ 1 → compensation ≈ 1 (no change).
-	// At high roughness bias shrinks → compensation grows.
-	// Clamp bias to avoid division by zero at extreme angles.
+	// Filament formula: 1 + f0 * (1/Ess - 1)
+	// At low roughness Ess ≈ 1 → compensation ≈ 1 (no change).
+	// At high roughness Ess shrinks → compensation grows.
 	return 1.0 + specularColor * (1.0 / max(Ess, 0.001) - 1.0);
 }
 
