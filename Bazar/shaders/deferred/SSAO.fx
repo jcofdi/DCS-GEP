@@ -81,17 +81,6 @@ float fastACos(float x)
 	return (x >= 0) ? res : GTAO_PI - res;
 }
 
-// Octahedral unit vector encoding (Cigolle et al. 2014)
-// Maps any unit-length 3D direction to 2 floats in [-1, 1]
-// with no singularities or sign ambiguity. Used for bent normal packing.
-float2 octEncode(float3 n) {
-	float t = abs(n.x) + abs(n.y) + abs(n.z);
-	float2 o = n.xy / t;
-	if (n.z < 0.0)
-		o = (1.0 - abs(o.yx)) * (o.xy >= 0.0 ? 1.0 : -1.0);
-	return o;
-}
-
 // GTAO Core - Horizon-Based Ambient Occlusion
 
 float4 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SLICES, uniform int STEPS, uniform float DIST_FACTOR) {
