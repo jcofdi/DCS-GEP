@@ -499,7 +499,7 @@ float3 ComposeSample(ComposerInput i, uint idx, uniform bool useShadows, uniform
 float3 ShadeTerrain(EnvironmentIrradianceSample eis, float3 sunColor,
 	float3 diffuseColor, float3 normal, float roughness, float shadow,
 	float cloudShadow, float AO, float3 viewDir, float3 pos,
-	float2 energyLobe = {1,1}, float bakedAO = 1.0)
+	float2 energyLobe = {1,1}, float bakedAO = 1.0, float3 geoNormal = float3(0,0,0))
 {
 	const float3 specularColor = 0.04;
 	const float metallic = 0.0;
@@ -507,7 +507,7 @@ float3 ShadeTerrain(EnvironmentIrradianceSample eis, float3 sunColor,
 	return ShadeSolid(eis, sunColor, diffuseColor, specularColor, normal,
 		roughness, metallic, shadow, cloudShadow, AO, viewDir, pos,
 		energyLobe, LERP_ENV_MAP, 0, false, float2(0,0), false,
-		bakedAO);
+		bakedAO, geoNormal);
 }
 
 float3 ShadeVegetation(EnvironmentIrradianceSample eis, float3 sunColor,
