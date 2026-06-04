@@ -507,7 +507,7 @@ float3 ShadeTerrain(EnvironmentIrradianceSample eis, float3 sunColor,
 	return ShadeSolid(eis, sunColor, diffuseColor, specularColor, normal,
 		roughness, metallic, shadow, cloudShadow, AO, viewDir, pos,
 		energyLobe, LERP_ENV_MAP, 0, false, float2(0,0), false,
-		bakedAO, geoNormal);
+		bakedAO);
 }
 
 float3 ShadeVegetation(EnvironmentIrradianceSample eis, float3 sunColor,
