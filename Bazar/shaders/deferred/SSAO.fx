@@ -91,20 +91,20 @@ float4 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SL
 	// per-pixel noise on flat surfaces while preserving accurate normals at
 	// object edges (where averaging would otherwise produce a "wrong" normal
 	// between two surface orientations and corrupt the slice integration).
-	float3 vNormal = DecodeNormal(pix, 0);
-	float centerDepth = vPos.z;
-	[unroll]
-	for (uint j = 1; j < 4; ++j) {
-		static const int2 offs[4] = { {0,0}, {0,1}, {1,1}, {1,0} };
-		uint2 npix = pix + offs[j];
-		float nDepth = reconstructViewPos(npix).z;
-		// 5% relative threshold: within-surface depth variation (normal-map
-		// relief, subpixel geometry) stays below this; silhouettes and panel
-		// gaps exceed it. Scales automatically with distance.
-		float depthWeight = abs(nDepth - centerDepth) < (centerDepth * 0.05) ? 0.9 : 0.0;
-		vNormal += DecodeNormal(npix, 0) * depthWeight;
-	}
-	vNormal = mul(normalize(vNormal), (float3x3)gView);
+	// UPDATE - GBuffer was found to composite and then discard geometric normal.
+	// Revised GBuffer, Decoder, and consumers to carry geometric normal.
+	// Use geometric normal below for improved accuracy.
+	float3 vNormal = DecodeGeometricNormal(pix, 0);
+    float centerDepth = vPos.z;
+    [unroll]
+    for (uint j = 1; j < 4; ++j) {
+        static const int2 offs[4] = { {0,0}, {0,1}, {1,1}, {1,0} };
+        uint2 npix = pix + offs[j];
+        float nDepth = reconstructViewPos(npix).z;
+        float depthWeight = abs(nDepth - centerDepth) < (centerDepth * 0.05) ? 0.9 : 0.0;
+        vNormal += DecodeGeometricNormal(npix, 0) * depthWeight;
+    }
+    vNormal = mul(normalize(vNormal), (float3x3)gView);
 
 	// View direction (from surface point toward camera)
 	float3 viewVec = normalize(-vPos);
