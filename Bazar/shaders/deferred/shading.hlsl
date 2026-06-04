@@ -141,7 +141,7 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 
 	// Suppress GTAO convex-surface artifacts at grazing for diffuse IBL.
 	float3 gnFade = dot(geoNormal, geoNormal) > 0.5 ? geoNormal : normal;
-	float novFade = smoothstep(0.1, 0.4, dot(geoNormal, viewDir));
+	float novFade = smoothstep(0.1, 0.4, dot(gnFade, viewDir));
 	float fadedAO = lerp(bakedAO, AO, novFade);
 
 	float roughnessSun = modifyRoughnessByCloudShadow(roughness, cloudShadow);
