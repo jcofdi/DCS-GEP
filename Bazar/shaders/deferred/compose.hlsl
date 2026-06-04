@@ -413,6 +413,7 @@ float3 ComposeCockpitSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	float3 diffuse, normal, emissive;
 	float4 aorms;
 	DecodeGBuffer(i.gbuffer, uv, idx, diffuse, normal, aorms, emissive);
+	float3 geoNormal = DecodeGeometricNormal(i.gbuffer);
 
 	float cascadeShadow = 1;
 	float terranAndCloudsShadow = 1;
@@ -420,7 +421,7 @@ float3 ComposeCockpitSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	float2 texCoord = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
 	if(useShadows)
 	{
-		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, normal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_FIRST_MIP_ONLY | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, geoNormal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_FIRST_MIP_ONLY | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 		terranAndCloudsShadow = min(shadow.terrain, shadow.clouds.x);
 		cascadeShadow = shadow.cascade;
 	}
@@ -454,11 +455,12 @@ float3 ComposeSample(ComposerInput i, uint idx, uniform bool useShadows, uniform
 	float3 diffuse, normal, emissive;
 	float4 aorms;
 	DecodeGBuffer(i.gbuffer, uv, idx, diffuse, normal, aorms, emissive);
+	float3 geoNormal = DecodeGeometricNormal(i.gbuffer);
 
 	float2 texCoord = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
 	ShadowBuffer shadow = initShadowBuffer();
 	if (useShadows)
-		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, normal, bMSAA_Edge, true, SF_FADE_CASCADE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, geoNormal, bMSAA_Edge, true, SF_FADE_CASCADE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 
 	float bakedAO = aorms.x;
 	float AO = bakedAO;
@@ -557,6 +559,7 @@ float3 ComposeTerrainSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	float3 diffuse, normal, emissive;
 	float4 aorms;
 	DecodeGBuffer(i.gbuffer, uv, idx, diffuse, normal, aorms, emissive);
+	float3 geoNormal = DecodeGeometricNormal(i.gbuffer);
 
 	// if (discardInsideFog) {
 	// 	if(DiscardEdgeInsideFog(i.depth, wPos)) {
@@ -568,7 +571,7 @@ float3 ComposeTerrainSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	float2 texCoord = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
 	ShadowBuffer shadow = initShadowBuffer();
 	if (useShadows)
-		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, normal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_SOFTEN_TERRAIN_SHADOW | SF_IS_TERRAIN_SURFACE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, geoNormal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_SOFTEN_TERRAIN_SHADOW | SF_IS_TERRAIN_SURFACE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 
 	float bakedAO = aorms.x;
 	float AO = bakedAO;
@@ -626,7 +629,6 @@ float3 ComposeTerrainSample(ComposerInput i, uint idx, uniform bool useShadows, 
 #endif
 }
 
-//GEP Note - VV OceanMod lines brought in for this version 
 float3 ComposeWaterSample(ComposerInput i, uint idx, uniform bool useShadows, uniform bool useBlurFlatShadows, uniform bool discardInsideFog = false, uniform bool bMSAA_Edge=false, uniform int mode = 0)
 {
 #if !defined(DISABLE_WATER_SHADING) && 1
