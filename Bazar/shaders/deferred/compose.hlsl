@@ -397,11 +397,11 @@ ShadowBuffer SampleShadowBuffer(uint2 pixPos, float2 uv, uint sampleIdx, float3 
 	}
 #endif
 
+	// [MOD] Cloud shadow decoupled from finalShadow.
 	if (flags & SF_SOFTEN_TERRAIN_SHADOW)
-		o.finalShadow = min(SoftenTerrainShadow(min(min(o.cascade, o.terrain), sss), wPos), o.clouds.x);
+		o.finalShadow = SoftenTerrainShadow(min(min(o.cascade, o.terrain), sss), wPos);
 	else
-		o.finalShadow = min(min(min(o.cascade, o.terrain), sss), o.clouds.x);
-
+		o.finalShadow = min(min(o.cascade, o.terrain), sss);
 	return o;
 }
 
@@ -424,10 +424,11 @@ float3 ComposeCockpitSample(ComposerInput i, uint idx, uniform bool useShadows, 
 		terranAndCloudsShadow = min(shadow.terrain, shadow.clouds.x);
 		cascadeShadow = shadow.cascade;
 	}
-	float AO = aorms.x;
+	float bakedAO = aorms.x;
+	float AO = bakedAO;
 	if (useSSAO) {
 		float vz = calcViewZ(i.depth, i.projPos.xy);
-		AO = min(AO, getSSAO(texCoord, vz));
+		AO = min(bakedAO, getSSAO(texCoord, vz));
 	}
 
 	float2 uvSSLR = float2(0, 0);
@@ -438,7 +439,7 @@ float3 ComposeCockpitSample(ComposerInput i, uint idx, uniform bool useShadows, 
 
 	float3 viewDir = normalize(gCameraPos.xyz - wPos);
 	float3 sunColor = SampleSunRadiance(wPos, gSunDir) * terranAndCloudsShadow;
-	float3 finalColor = ShadeCockpit(uv, useCockpitGI, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, cascadeShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), false, 1, useSSLR, uvSSLR);
+	float3 finalColor = ShadeCockpit(uv, useCockpitGI, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, cascadeShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), false, 1, useSSLR, uvSSLR, float3(0,0,0), bakedAO);
 
 	return finalColor;
 #endif
@@ -459,17 +460,11 @@ float3 ComposeSample(ComposerInput i, uint idx, uniform bool useShadows, uniform
 	if (useShadows)
 		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, normal, bMSAA_Edge, true, SF_FADE_CASCADE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 
-	float AO = aorms.x;
+	float bakedAO = aorms.x;
+	float AO = bakedAO;
 	if (useSSAO) {
 		float vz = calcViewZ(i.depth, i.projPos.xy);
-		AO = min(AO, getSSAO(texCoord, vz));
-	}
-
-	// Fetch bent normal from GTAO output buffer.
-	// Available whenever SSAO is enabled (same buffer, .yz channels).
-	float3 bentNormal = float3(0,0,0);
-	if (useSSAO) {
-		bentNormal = getBentNormal(texCoord);
+		AO = min(bakedAO, getSSAO(texCoord, vz));
 	}
 
 	float2 uvSSLR = float2(0, 0);
@@ -483,8 +478,9 @@ float3 ComposeSample(ComposerInput i, uint idx, uniform bool useShadows, uniform
 	DEBUG_OUTPUT(diffuse, normal, aorms.yz, shadow.finalShadow, emissive, AO, aorms.w, wPos, uv);
 
 	float3 viewDir = normalize(gCameraPos.xyz - wPos);
-	float3 sunColor = SampleSunRadiance(wPos, gSunDir);
-	float3 finalColor = ShadeHDR(uv, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, shadow.finalShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), LERP_ENV_MAP, useSSLR, uvSSLR, LL_SOLID, false, true, bentNormal);
+	// [MOD] Cloud shadow dims available sunlight directly.
+	float3 sunColor = SampleSunRadiance(wPos, gSunDir) * shadow.clouds.x;
+	float3 finalColor = ShadeHDR(uv, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, shadow.finalShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), LERP_ENV_MAP, useSSLR, uvSSLR, LL_SOLID, false, true, bakedAO);
 
 	return finalColor;
 #endif
@@ -498,15 +494,24 @@ float3 ComposeSample(ComposerInput i, uint idx, uniform bool useShadows, uniform
 // 	/*return (depth < DEPTH_COVERAGE_TEST) && (fogHeight + distance(gCameraPos, wPos) > length(wPos + gOrigin)-gEarthRadius);*/
 // }
 
-float3 ShadeTerrain(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffuseColor, float3 normal, float roughness, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe = {1,1})
+float3 ShadeTerrain(EnvironmentIrradianceSample eis, float3 sunColor,
+	float3 diffuseColor, float3 normal, float roughness, float shadow,
+	float cloudShadow, float AO, float3 viewDir, float3 pos,
+	float2 energyLobe = {1,1}, float bakedAO = 1.0)
 {
 	const float3 specularColor = 0.04;
 	const float metallic = 0.0;
 
-	return ShadeSolid(eis, sunColor, diffuseColor, specularColor, normal, roughness, metallic, shadow, cloudShadow, AO, viewDir, pos, energyLobe);
+	return ShadeSolid(eis, sunColor, diffuseColor, specularColor, normal,
+		roughness, metallic, shadow, cloudShadow, AO, viewDir, pos,
+		energyLobe, LERP_ENV_MAP, 0, false, float2(0,0), false,
+		float3(0,0,0), bakedAO);
 }
 
-float3 ShadeVegetation(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffuseColor, float3 normal, float roughness, float shadow, float cloudShadow, float AO, float3 viewDir, float3 pos, float2 energyLobe)
+float3 ShadeVegetation(EnvironmentIrradianceSample eis, float3 sunColor,
+	float3 diffuseColor, float3 normal, float roughness, float shadow,
+	float cloudShadow, float AO, float3 viewDir, float3 pos,
+	float2 energyLobe, float bakedAO = 1.0)
 {
 	const float3 specularColor = 0.04;
 	const float vegetationTranslucency = 0.05;
@@ -514,9 +519,21 @@ float3 ShadeVegetation(EnvironmentIrradianceSample eis, float3 sunColor, float3 
 	float NoL = max(0, dot(normal, gSunDir));
 	float roughnessSun = modifyRoughnessByCloudShadow(roughness, cloudShadow);
 
+	// Baked AO micro-shadowing on direct sun term (Naughty Dog,
+	// Uncharted 4 SIGGRAPH 2016). Uses clean texture AO, no engagement
+	// guard needed.
+	float microShadow = 1.0;
+	if (bakedAO < 0.999) {
+		float cosConeAngle = sqrt(1.0 - bakedAO);
+		microShadow = saturate(NoL / max(cosConeAngle, 0.001));
+		microShadow *= microShadow;
+	}
+
 	// translucent specular sun light
-	float  lightAmountSpec = gSunIntensity * shadow * NoL;//max(0, -NoL);
-	float3 finalColor = (ShadingSimple(diffuseColor, specularColor, roughnessSun, normal, viewDir, gSunDir, energyLobe) * sunColor) * lightAmountSpec;
+	float lightAmountSpec = gSunIntensity * NoL * shadow; // testing without microShadow
+	float3 finalColor = (ShadingSimple(diffuseColor, specularColor,
+		roughnessSun, normal, viewDir, gSunDir, energyLobe) * sunColor)
+		* lightAmountSpec;
 
 	//diffuse IBL
 	finalColor += diffuseColor * SampleEnvironmentMapApprox(eis, normal, 1.0) * (gIBLIntensity * AO * energyLobe.x);
@@ -553,10 +570,11 @@ float3 ComposeTerrainSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	if (useShadows)
 		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, normal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_SOFTEN_TERRAIN_SHADOW | SF_IS_TERRAIN_SURFACE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 
-	float AO = aorms.x;
+	float bakedAO = aorms.x;
+	float AO = bakedAO;
 	if (useSSAO) {
 		float vz = calcViewZ(i.depth, i.projPos.xy);
-		AO = min(AO, getSSAO(texCoord, vz));
+		AO = min(bakedAO, getSSAO(texCoord, vz));
 	}
 	float3 dir = gCameraPos.xyz - wPos;
 	float  dist = length(dir);
@@ -568,7 +586,8 @@ float3 ComposeTerrainSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	diffuse = ColorTuning(diffuse, terrainAlbedoParams.x, terrainAlbedoParams.y, terrainAlbedoParams.z, terrainAlbedoParams.w);
 #endif
 
-	float3 sunColor = SampleSunRadiance(wPos, gSunDir);
+	// [MOD] Cloud shadow dims available sunlight directly.
+	float3 sunColor = SampleSunRadiance(wPos, gSunDir) * shadow.clouds.x;
 
 	float vegetationMask = aorms.z;
 	float vegetationRoughness = 0.8;
@@ -589,9 +608,9 @@ float3 ComposeTerrainSample(ComposerInput i, uint idx, uniform bool useShadows, 
 
 	float3 baseColor	   = GammaToLinearSpace(diffuse);
 
-	float3 surfaceColor	   = ShadeTerrain(eis, sunColor * lightDecay, baseColor, normal, aorms.y, shadow.finalShadow, shadow.clouds.x, AO, viewDir, wPos, float2(1, specular));
+	float3 surfaceColor	   = ShadeTerrain(eis, sunColor * lightDecay, baseColor, normal, aorms.y, shadow.finalShadow, shadow.clouds.x, AO, viewDir, wPos, float2(1, specular), bakedAO);
 
-	float3 vegetationColor = ShadeVegetation(eis, sunColor * lightDecay, baseColor, normal, vegetationRoughness, shadow.finalShadow, shadow.clouds.x, AO, viewDir, wPos, float2(1, vegetationSpecular));
+	float3 vegetationColor = ShadeVegetation(eis, sunColor * lightDecay, baseColor, normal, vegetationRoughness, shadow.finalShadow, shadow.clouds.x, AO, viewDir, wPos, float2(1, vegetationSpecular), bakedAO);
 
 	float3 finalColor = lerp(surfaceColor, vegetationColor, vegetationMask);
 
@@ -613,9 +632,10 @@ float3 ComposeWaterSample(ComposerInput i, uint idx, uniform bool useShadows, un
 	uint2 uv = i.uv;
 	float3 wPos = i.wPos;
 	float3 normal;
-	float foam, wLevel;
+	// VV modified
+	float foam, isWake, wLevel;
 	float deepFactor, riverLerp;
-	DecodeGBufferWater(i.gbuffer, uv, idx, normal, wLevel, foam, deepFactor, riverLerp);
+	DecodeGBufferWater(i.gbuffer, uv, idx, normal, wLevel, foam, isWake, deepFactor, riverLerp);
 
 	// if (discardInsideFog) {
 	// 	if (DiscardEdgeInsideFog(i.depth, wPos)) {
@@ -631,7 +651,7 @@ float3 ComposeWaterSample(ComposerInput i, uint idx, uniform bool useShadows, un
 
 	DEBUG_OUTPUT(float3(0,0,1), normal, float2(0,0), shadow.finalShadow, float3(0,0,0), 1, 1, wPos, uv);
 
-	float3 finalColor = waterCompose(uv, texCoord, wPos, normal, shadow.finalShadow, wLevel, foam, deepFactor, riverLerp);
+	float3 finalColor = waterCompose(uv, texCoord, wPos, normal, shadow.finalShadow, wLevel, foam, isWake, deepFactor, riverLerp);
 
 	return finalColor;
 #endif
@@ -726,7 +746,8 @@ float3 ComposeGrassSample(ComposerInput i, uint idx, uniform bool useShadows, un
 
 	DEBUG_OUTPUT(diffuse, normal, float2(0,0), shadow.finalShadow, float4(0,0,0,0), AO, 1, wPos, uv);
 
-	float3 sunColor = SampleSunRadiance(wPos, gSunDir);
+	// [MOD] Cloud shadow dims available sunlight directly.
+	float3 sunColor = SampleSunRadiance(wPos, gSunDir) * shadow.clouds.x;
 
 	float3 finalColor = ShadeGrass(uv, sunColor, diffuse, normal, roughness, translucency, shadow.finalShadow, shadow.clouds, surfaceNoL, AO, viewDir, wPos, energyLobe);
 
@@ -771,7 +792,8 @@ float3 ComposeFoliageSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	DEBUG_OUTPUT(diffuse, normal, float2(roughness, 0), shadow.finalShadow, emissive, AO, aorms.w, wPos, uv);
 	float3 viewDir = normalize(gCameraPos.xyz - wPos);
 
-	float3 sunColor = SampleSunRadiance(wPos, gSunDir);
+	// [MOD] Cloud shadow dims available sunlight directly.
+	float3 sunColor = SampleSunRadiance(wPos, gSunDir) * shadow.clouds.x;
 	float3 finalColor = ShadeFoliage(uv, sunColor, diffuse, normal, roughness, translucency, shadow.finalShadow, AO, shadow.clouds, viewDir, wPos);
 
 	finalColor += emissive.rgb;
