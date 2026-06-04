@@ -159,7 +159,7 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 	//           slider 3.5 -> +1.3 EV (brighter)
 	{
 		float userGamma  = 1.0 / outputGammaInv;
-		float userEVBias = (userGamma - 2.2) * 2.0;
+		float userEVBias = (userGamma - 2.2) * 1.0;
 		exposure *= exp2(userEVBias);
 	}
 
@@ -173,7 +173,7 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 
 
 	// Stock bloom composite (lerp-based)
-	float3 linearColor = lerp(sceneColor, bloom, bloomLerpFactor) * exposure;
+	float3 linearColor = lerp(sceneColor, bloom, 0.07) * exposure;
 
 	if(whiteBalanceFactor>0)
 	{
