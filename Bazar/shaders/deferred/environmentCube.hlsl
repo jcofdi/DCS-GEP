@@ -10,7 +10,8 @@ TextureCube environmentCockpitMap: 	register(t100);
 Texture2D   SSLRMap:			register(t98);
 
 float3 EnvBRDFApproxK(float3 specularColor, float roughness, float NoV, float k) {
-	float3 brdf = EnvBRDFApprox(specularColor, roughness, NoV);
+	float2 GF = preintegratedGF.SampleLevel(gBilinearClampSampler, float2(roughness, NoV), 0);
+	float3 brdf = specularColor * GF.x + saturate(50.0 * specularColor.g) * GF.y;
 	float f = (1 - exp(-NoV)) * 2.71828182846;	// integral [0..1] of it = 1
 	return brdf * lerp(1, f, k);
 }
