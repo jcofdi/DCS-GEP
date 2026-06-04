@@ -42,7 +42,7 @@ struct PS_OUTPUT_GLASS {
 };
 
 #define CALC_GLASS_FRESHEN			1
-#define CALC_GLASS_TRANSMITTANCE	0 //for the future
+#define CALC_GLASS_TRANSMITTANCE	1 //for the future (JC note - the future is now, old man)
 
 #include "functions/shading.hlsl"
 
@@ -190,6 +190,11 @@ float4 forward_ps_pass_droplets(VS_OUTPUT input, uniform int Flags): SV_TARGET0 
 
 #ifdef DIFFUSE_UV
 
+	// Refraction perturbation scale for water droplets on canopy glass.
+	// 1.0 = stock (20x industry standard), 0.05 = GPU Gems 2 reference.
+	// Recommended range: 0.05 (subtle) to 0.20 (pronounced).
+	static const float DROPLET_REFRACTION_SCALE = 0.10;
+
 	float4 colorMul, colorAdd;
 	calcGlassColors(input, Flags, colorMul, colorAdd);
 
@@ -208,7 +213,7 @@ float4 forward_ps_pass_droplets(VS_OUTPUT input, uniform int Flags): SV_TARGET0 
 	n = mul(n, tangentSpace);
 
 	float2 ruv = float2(input.projPos.x, -input.projPos.y) / input.projPos.w;
-	float3 duv = mul(normal - n, (float3x3)gView);
+	float3 duv = mul(normal - n, (float3x3)gView) * DROPLET_REFRACTION_SCALE;
 
 	float4 colorDst;
 	[unroll]
