@@ -361,6 +361,16 @@ ShadowBuffer initShadowBuffer()
 #define SF_BLUR_FLAT_SHADOW			(1 << 7)
 #define SF_IS_TERRAIN_SURFACE		(1 << 8)
 #define SF_SSS						(1 << 9)
+#define SF_SSS_FOLIAGE				(1 << 10)
+
+// [MOD] SSS receive on foliage: distance-ramped.
+// Near field: depth buffer resolves individual leaves; marching it as an
+// opaque heightfield produces blanket false self-shadowing -> exclude.
+// Far field: canopy depth collapses to a crown-top heightfield, where the
+// marcher's occlusion model is approximately valid and provides the only
+// inter-tree shadowing beyond cascade range -> restore.
+static const float FOLIAGE_SSS_NEAR = 1000.0;  // full exclusion inside (m)
+static const float FOLIAGE_SSS_FAR  = 3500.0;  // full strength beyond (m)
 
 ShadowBuffer SampleShadowBuffer(uint2 pixPos, float2 uv, uint sampleIdx, float3 wPos, float depth, float3 normal,
 	uniform bool bMSAA_Edge,
@@ -389,11 +399,17 @@ ShadowBuffer SampleShadowBuffer(uint2 pixPos, float2 uv, uint sampleIdx, float3 
 
 	float sss = 1;
 #if USE_SSS
-	if(flags & SF_SSS) {
+	if(flags & (SF_SSS | SF_SSS_FOLIAGE)) {
 		if(bMSAA_Edge) 
 			sss = getSSS_MSAA(pixPos, depth);
 		else
 			sss = getSSS(pixPos);
+
+		// [MOD] Vegetation receivers: attenuate screen-space shadow.
+		if (flags & SF_SSS_FOLIAGE) {
+			float sssStrength = smoothstep(FOLIAGE_SSS_NEAR, FOLIAGE_SSS_FAR, dist);
+			sss = lerp(1.0, sss, sssStrength);
+}
 	}
 #endif
 
@@ -413,7 +429,6 @@ float3 ComposeCockpitSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	float3 diffuse, normal, emissive;
 	float4 aorms;
 	DecodeGBuffer(i.gbuffer, uv, idx, diffuse, normal, aorms, emissive);
-	float3 geoNormal = DecodeGeometricNormal(i.gbuffer);
 
 	float cascadeShadow = 1;
 	float terranAndCloudsShadow = 1;
@@ -421,7 +436,7 @@ float3 ComposeCockpitSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	float2 texCoord = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
 	if(useShadows)
 	{
-		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, geoNormal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_FIRST_MIP_ONLY | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, normal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_FIRST_MIP_ONLY | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 		terranAndCloudsShadow = min(shadow.terrain, shadow.clouds.x);
 		cascadeShadow = shadow.cascade;
 	}
@@ -440,7 +455,7 @@ float3 ComposeCockpitSample(ComposerInput i, uint idx, uniform bool useShadows, 
 
 	float3 viewDir = normalize(gCameraPos.xyz - wPos);
 	float3 sunColor = SampleSunRadiance(wPos, gSunDir) * terranAndCloudsShadow;
-	float3 finalColor = ShadeCockpit(uv, useCockpitGI, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, cascadeShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), false, 1, useSSLR, uvSSLR, bakedAO, geoNormal);
+	float3 finalColor = ShadeCockpit(uv, useCockpitGI, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, cascadeShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), false, 1, useSSLR, uvSSLR, bakedAO);
 
 	return finalColor;
 #endif
@@ -455,12 +470,11 @@ float3 ComposeSample(ComposerInput i, uint idx, uniform bool useShadows, uniform
 	float3 diffuse, normal, emissive;
 	float4 aorms;
 	DecodeGBuffer(i.gbuffer, uv, idx, diffuse, normal, aorms, emissive);
-	float3 geoNormal = DecodeGeometricNormal(i.gbuffer);
 
 	float2 texCoord = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
 	ShadowBuffer shadow = initShadowBuffer();
 	if (useShadows)
-		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, geoNormal, bMSAA_Edge, true, SF_FADE_CASCADE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, normal, bMSAA_Edge, true, SF_FADE_CASCADE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 
 	float bakedAO = aorms.x;
 	float AO = bakedAO;
@@ -482,7 +496,7 @@ float3 ComposeSample(ComposerInput i, uint idx, uniform bool useShadows, uniform
 	float3 viewDir = normalize(gCameraPos.xyz - wPos);
 	// [MOD] Cloud shadow dims available sunlight directly.
 	float3 sunColor = SampleSunRadiance(wPos, gSunDir) * shadow.clouds.x;
-	float3 finalColor = ShadeHDR(uv, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, shadow.finalShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), LERP_ENV_MAP, useSSLR, uvSSLR, LL_SOLID, false, true, bakedAO, geoNormal);
+	float3 finalColor = ShadeHDR(uv, sunColor, diffuse, normal, aorms.y, aorms.z, emissive, shadow.finalShadow, AO, shadow.clouds, viewDir, wPos, float2(1, aorms.w), LERP_ENV_MAP, useSSLR, uvSSLR, LL_SOLID, false, true, bakedAO);
 
 	return finalColor;
 #endif
@@ -499,7 +513,7 @@ float3 ComposeSample(ComposerInput i, uint idx, uniform bool useShadows, uniform
 float3 ShadeTerrain(EnvironmentIrradianceSample eis, float3 sunColor,
 	float3 diffuseColor, float3 normal, float roughness, float shadow,
 	float cloudShadow, float AO, float3 viewDir, float3 pos,
-	float2 energyLobe = {1,1}, float bakedAO = 1.0, float3 geoNormal = float3(0,0,0))
+	float2 energyLobe = {1,1}, float bakedAO = 1.0)
 {
 	const float3 specularColor = 0.04;
 	const float metallic = 0.0;
@@ -507,7 +521,7 @@ float3 ShadeTerrain(EnvironmentIrradianceSample eis, float3 sunColor,
 	return ShadeSolid(eis, sunColor, diffuseColor, specularColor, normal,
 		roughness, metallic, shadow, cloudShadow, AO, viewDir, pos,
 		energyLobe, LERP_ENV_MAP, 0, false, float2(0,0), false,
-		bakedAO, geoNormal);
+		bakedAO);
 }
 
 float3 ShadeVegetation(EnvironmentIrradianceSample eis, float3 sunColor,
@@ -559,7 +573,6 @@ float3 ComposeTerrainSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	float3 diffuse, normal, emissive;
 	float4 aorms;
 	DecodeGBuffer(i.gbuffer, uv, idx, diffuse, normal, aorms, emissive);
-	float3 geoNormal = DecodeGeometricNormal(i.gbuffer);
 
 	// if (discardInsideFog) {
 	// 	if(DiscardEdgeInsideFog(i.depth, wPos)) {
@@ -571,7 +584,7 @@ float3 ComposeTerrainSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	float2 texCoord = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
 	ShadowBuffer shadow = initShadowBuffer();
 	if (useShadows)
-		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, geoNormal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_SOFTEN_TERRAIN_SHADOW | SF_IS_TERRAIN_SURFACE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, normal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_SOFTEN_TERRAIN_SHADOW | SF_IS_TERRAIN_SURFACE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 
 	float bakedAO = aorms.x;
 	float AO = bakedAO;
@@ -742,7 +755,7 @@ float3 ComposeGrassSample(ComposerInput i, uint idx, uniform bool useShadows, un
 	float2 texCoord = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
 	ShadowBuffer shadow = initShadowBuffer();
 	if(useShadows)
-		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, float3(0, 1, 0), bMSAA_Edge, false, SF_SOFTEN_TERRAIN_SHADOW | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, float3(0, 1, 0), bMSAA_Edge, false, SF_SOFTEN_TERRAIN_SHADOW | SF_SSS_FOLIAGE | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 
 	AO *= AO;
 	shadow.finalShadow = min(shadow.finalShadow, lerp(1, AO, grassAOInfluenceToDirectLight));
@@ -780,7 +793,7 @@ float3 ComposeFoliageSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	float2 texCoord = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
 	ShadowBuffer shadow = initShadowBuffer();
 	if (useShadows)
-		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, gSunDir.xyz, bMSAA_Edge, false, SF_FADE_CASCADE | SF_TREE_SHADOW | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, gSunDir.xyz, bMSAA_Edge, false, SF_FADE_CASCADE | SF_TREE_SHADOW | SF_SSS_FOLIAGE | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 
 	float AO = aorms.x;
 	if (useSSAO) {
