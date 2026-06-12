@@ -190,10 +190,11 @@ float4 forward_ps_pass_droplets(VS_OUTPUT input, uniform int Flags): SV_TARGET0 
 
 #ifdef DIFFUSE_UV
 
-	// Refraction perturbation scale for water droplets on canopy glass.
-	// 1.0 = stock (20x industry standard), 0.05 = GPU Gems 2 reference.
-	// Recommended range: 0.05 (subtle) to 0.20 (pronounced).
-	static const float DROPLET_REFRACTION_SCALE = 0.10;
+	// Refraction response curve for water on canopy glass.
+	// POWER < 1.0 compresses dynamic range: lifts wind streaks,
+	// caps peak droplet displacement. 1.0 = linear (no compression).
+	static const float DROPLET_REFRACTION_SCALE = 0.04;
+	static const float DROPLET_REFRACTION_POWER = 0.6;
 
 	float4 colorMul, colorAdd;
 	calcGlassColors(input, Flags, colorMul, colorAdd);
@@ -213,7 +214,10 @@ float4 forward_ps_pass_droplets(VS_OUTPUT input, uniform int Flags): SV_TARGET0 
 	n = mul(n, tangentSpace);
 
 	float2 ruv = float2(input.projPos.x, -input.projPos.y) / input.projPos.w;
-	float3 duv = mul(normal - n, (float3x3)gView) * DROPLET_REFRACTION_SCALE;
+	float3 duv = mul(normal - n, (float3x3)gView);
+	float duvMag = length(duv.xy);
+	float scaledMag = pow(duvMag, DROPLET_REFRACTION_POWER) * DROPLET_REFRACTION_SCALE;
+	duv.xy *= scaledMag / max(duvMag, 1e-5);
 
 	float4 colorDst;
 	[unroll]
