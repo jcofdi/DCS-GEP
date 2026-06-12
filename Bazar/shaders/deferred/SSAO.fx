@@ -81,31 +81,34 @@ float fastACos(float x)
 	return (x >= 0) ? res : GTAO_PI - res;
 }
 
+float3 calcGeoNormal(uint2 px, float3 center) {
+    float3 pL = reconstructViewPos(px - uint2(1, 0));
+    float3 pR = reconstructViewPos(px + uint2(1, 0));
+    float3 pU = reconstructViewPos(px - uint2(0, 1));
+    float3 pD = reconstructViewPos(px + uint2(0, 1));
+    float3 ddx = abs(pR.z - center.z) < abs(pL.z - center.z) ? (pR - center) : (center - pL);
+    float3 ddy = abs(pD.z - center.z) < abs(pU.z - center.z) ? (pD - center) : (center - pU);
+    float3 n = normalize(cross(ddx, ddy));
+    return dot(n, center) > 0 ? -n : n;
+}
+
 // GTAO Core - Horizon-Based Ambient Occlusion
 
 float4 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SLICES, uniform int STEPS, uniform float DIST_FACTOR) {
 	
-	// Decode the surface normal from the GBuffer and transform to view space.
-	// Depth-aware neighbor blending: average with 2x2 neighbors where depth
-	// is continuous, skip where a silhouette edge is detected. This removes
-	// per-pixel noise on flat surfaces while preserving accurate normals at
-	// object edges (where averaging would otherwise produce a "wrong" normal
-	// between two surface orientations and corrupt the slice integration).
-	// UPDATE - GBuffer was found to composite and then discard geometric normal.
-	// Revised GBuffer, Decoder, and consumers to carry geometric normal.
-	// Use geometric normal below for improved accuracy.
-	float3 vNormal = DecodeGeometricNormal(pix, 0);
-    float centerDepth = vPos.z;
-    [unroll]
-    for (uint j = 1; j < 4; ++j) {
-        static const int2 offs[4] = { {0,0}, {0,1}, {1,1}, {1,0} };
-        uint2 npix = pix + offs[j];
-        float nDepth = reconstructViewPos(npix).z;
-        float depthWeight = abs(nDepth - centerDepth) < (centerDepth * 0.05) ? 0.9 : 0.0;
-        vNormal += DecodeGeometricNormal(npix, 0) * depthWeight;
-    }
-    vNormal = mul(normalize(vNormal), (float3x3)gView);
-
+	// Reconstruct geometric normal from depth buffer neighbors.
+	float3 vNormal = calcGeoNormal(pix, vPos);
+	float centerDepth = vPos.z;
+	[unroll]
+	for (uint j = 1; j < 4; ++j) {
+		static const int2 offs[4] = { {0,0}, {0,1}, {1,1}, {1,0} };
+		uint2 npix = pix + offs[j];
+		float3 nPos = reconstructViewPos(npix);
+		float depthWeight = abs(nPos.z - centerDepth) < (centerDepth * 0.05) ? 0.9 : 0.0;
+		vNormal += calcGeoNormal(npix, nPos) * depthWeight;
+	}
+	vNormal = normalize(vNormal);
+	
 	// View direction (from surface point toward camera)
 	float3 viewVec = normalize(-vPos);
 
