@@ -9,30 +9,29 @@
 
 #define USE_ROTATE_PCF 1
 #define BASE_SHADOWMAP_SIZE 4096
-#define BASE_SHADOWMAP_BIAS 0.0004
+#define BASE_SHADOWMAP_BIAS 0.0002
 
-// ── Normal offset bias ──────────────────────────────────────────────
-// World-space offset along the surface normal applied before shadow
-// map lookup.  Prevents self-shadowing by geometrically moving the
-// lookup point above the receiver surface.
+// ── Texel-proportional normal offset bias ───────────────────────────
+// Cascade-invariant acne prevention.  Offsets the shadow lookup point
+// along the surface normal by a fixed number of SHADOW TEXELS.
 //
-// The offset is scaled by (1 - NoL): maximum at sun-grazing angles
-// where shadow texels are stretched across the surface and self-
-// intersection is worst, zero at perpendicular where it's not needed.
+// Expressing the offset in texels rather than world-space meters
+// makes it automatically correct at every cascade density and every
+// shadow resolution.  Normal-map bump noise creates ~5% variation
+// in the offset magnitude through NoL, which at 2 texels maps to
+// ~0.1 texels of variation -- sub-texel, invisible.
 //
-// This is the primary acne prevention mechanism.  BASE_SHADOWMAP_BIAS
-// handles residual depth quantization on top.
+// The offset is computed inside SampleShadowMap where texelsPerMeter
+// is known per-cascade.  Scaled by (1 - NoL): maximum at grazing,
+// zero at perpendicular.
 //
 // Guide:
-//   0.01 = minimal offset (may show acne at extreme grazing)
-//   0.02 = moderate (good starting point)
-//   0.04 = aggressive (eliminates most acne, may show shadow detachment
-//          at extreme grazing on thin geometry)
-//   0.08 = very aggressive (noticeable detachment on sharp edges)
-//
-// Unlike depth bias, failure is gentle: too-large values produce
-// slightly rounded shadow edges rather than global peter-panning.
-#define PCSS_NORMAL_OFFSET_SCALE 0.08
+//   1.0 = minimal (may show acne at extreme grazing)
+//   1.5 = conservative
+//   2.0 = recommended starting point
+//   3.0 = aggressive (eliminates most acne, mild shadow rounding)
+//   4.0 = very aggressive (visible shadow rounding at grazing)
+#define PCSS_NORMAL_OFFSET_TEXELS 4.0
 
 // ═══════════════════════════════════════════════════════════════════════════
 // [MOD] PCSS -- Percentage Closer Soft Shadows with Vogel Disk Sampling
@@ -83,7 +82,7 @@
 //   PCSS_RADIUS_OVERDRIVE   -- max multiplier on clean radius (1.0 = strict)
 //   PCSS_RIM_BIAS_EXPONENT  -- Vogel radial distribution (0.35-0.5)
 //   PCSS_MIN_BLOCKER_DIST   -- noise floor for blocker detection (meters)
-//   PCSS_NORMAL_OFFSET_SCALE -- world-space normal offset for acne prevention
+//   PCSS_NORMAL_OFFSET_TEXELS -- texel-proportional normal offset for acne prevention
 //
 // NOTE ON CASCADE NUMBERING:
 //   DCS cascade 3 = nearest to camera (highest texels/m)
@@ -96,6 +95,13 @@
 // Solar angular diameter in radians.  0.53 degrees = 0.00927 rad.
 // Increase slightly (0.012) for perceptually exaggerated penumbrae.
 #define PCSS_SUN_ANGULAR_DIAMETER 0.00927
+
+// Effective angular diameter of the cloud layer as a diffuse light
+// source.  Under full overcast, the entire cloud deck acts as an
+// area light roughly 28 degrees across (~0.5 rad).  This value is
+// the maximum effective angular diameter under full cloud occlusion.
+// Partial cloud cover interpolates between sun disk and this value.
+#define PCSS_CLOUD_ANGULAR_DIAMETER 0.5
 
 // Per-cascade tap budgets.
 //
@@ -179,31 +185,47 @@
 // search.  These are non-comparison SampleLevel reads (cheaper than
 // the PCF comparison taps).  8-16 provides good coverage.
 //
-// PCSS_BLOCKER_SEARCH_MIP: mip level for blocker search reads.
-// At mip 0, each tap reads one texel.
-// At mip 1, each tap reads a 2x2 block (averaged depth).
-// At mip 2, each tap reads a 4x4 block.
-// Higher mips give each tap broader coverage of the search disk,
-// dramatically improving blocker detection at wide search radii.
-// SET TO 0 IF DCS DOES NOT GENERATE SHADOW MAP MIP CHAINS -- higher
-// mip reads will return garbage.  Test by setting to 1 and checking
-// if shadow behavior degrades or produces artifacts.
 #define PCSS_BLOCKER_SEARCH_TAPS 16
-#define PCSS_BLOCKER_SEARCH_MIP 0
 
 
-#if USE_ROTATE_PCF
-float rnd(float2 xy) {
-	return frac(sin(dot(xy, float2(12.9898, 78.233))) * 43758.5453);
-}
-#endif
 
-
-float SampleShadowMap(float3 wPos, float NoL, uniform uint idx, uniform bool usePCF, uniform uint samplesMax, uniform bool useTreeShadow, uniform float floorRadius = 1.5)
+float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, uniform bool usePCF, uniform uint samplesMax, uniform bool useTreeShadow, uniform float floorRadius = 1.5)
 {
 	float bias = BASE_SHADOWMAP_BIAS * BASE_SHADOWMAP_SIZE / ShadowMapSize;
 
+	// Initial shadow projection for cascade metrics.
 	float4 shadowPos = mul(float4(wPos, 1.0), ShadowMatrix[idx]);
+
+	// ── Per-cascade texel density ───────────────────────────────
+	// Needed for normal offset, cloud PCSS modulation, and penumbra
+	// calculations.  Computed once here, reused throughout.
+	float3 sunPerp = abs(gSunDir.y) > 0.99
+		? normalize(cross(gSunDir, float3(1, 0, 0)))
+		: normalize(cross(gSunDir, float3(0, 1, 0)));
+	float2 sunPerpUV = mul(float4(sunPerp, 0.0), ShadowMatrix[idx]).xy
+		/ shadowPos.w;
+	float texelsPerMeter = length(sunPerpUV) * ShadowMapSize;
+
+	// Depth change per meter of travel toward the sun in shadow space.
+	// Positive in reversed-Z (moving toward sun = increasing depth).
+	// Used to convert shadow-space depth differences to world-space
+	// distances, replacing the expensive ShadowMatrixInv reconstruction.
+	// Exact for orthographic projection (which directional cascades are).
+	float zPerMeter = mul(float4(gSunDir.xyz, 0.0), ShadowMatrix[idx]).z;
+
+	// ── Texel-proportional normal offset ────────────────────────
+	// Offset along the surface normal by a fixed number of shadow
+	// texels.  Cascade-invariant: inner cascades (high density) get
+	// a small world-space push, outer cascades (low density) get a
+	// large one.  Normal-map bump noise at ~5% creates ~0.1 texels
+	// of variation -- sub-texel, invisible.
+	if (NoL < 1.0)
+	{
+		float metersPerTexel = 1.0 / max(texelsPerMeter, 1.0);
+		wPos += normal * (PCSS_NORMAL_OFFSET_TEXELS * metersPerTexel) * (1.0 - NoL);
+		shadowPos = mul(float4(wPos, 1.0), ShadowMatrix[idx]);
+	}
+
 	float3 shadowCoord = shadowPos.xyz / shadowPos.w;
 	float acc = cascadeShadowMap.SampleCmpLevelZero(gCascadeShadowSampler, float3(shadowCoord.xy, 3 - idx), saturate(shadowCoord.z) + bias);
 
@@ -221,29 +243,28 @@ float SampleShadowMap(float3 wPos, float NoL, uniform uint idx, uniform bool use
 		const uint count = samplesMax;
 
 		// Maximum clean PCF radius from tap count: sqrt(count * 4 / pi).
-		// Each tap covers ~4 texels squared (hardware bilinear footprint).
-		// This guarantees gap-free coverage without temporal filtering.
 		const float maxCleanRadius = sqrt((float)count * 4.0 / PI_VAL);
 
 		// Start with per-cascade floor; PCSS will widen if blockers found.
 		float pcssR = floorRadius;
 
 #if PCSS_ENABLE
-		// ── World-to-shadow-UV scale for this cascade ───────────────
-		// Computed before blocker search because both the adaptive
-		// search radius and the penumbra width need texels-per-meter.
-		//
-		// By linearity of the shadow matrix, offsetting the world
-		// position by 1 meter perpendicular to the sun direction and
-		// transforming gives us UV-per-meter directly.  The (sunPerp, 0)
-		// transform depends only on uniform inputs, so the compiler
-		// computes it once per draw.
-		float3 sunPerp = abs(gSunDir.y) > 0.99
-			? normalize(cross(gSunDir, float3(1, 0, 0)))
-			: normalize(cross(gSunDir, float3(0, 1, 0)));
-		float2 sunPerpUV = mul(float4(sunPerp, 0.0), ShadowMatrix[idx]).xy
-			/ shadowPos.w;
-		float texelsPerMeter = length(sunPerpUV) * ShadowMapSize;
+		// ── Cloud-modulated effective angular diameter ───────────
+		// Under cloud cover, the effective light source grows from the
+		// sun disk to a diffuse cloud layer.  Shadows soften because
+		// penumbra width = blockerDist * angularDiameter.
+		float effectiveAngularDiameter = PCSS_SUN_ANGULAR_DIAMETER;
+		float cloudOcclusion = 1.0;
+
+		if (gUseVolumetricCloudsShadow > 0)
+		{
+			float3 uvw = wPos * gCloudVolumeScale + gCloudVolumeOffset;
+			cloudOcclusion = cloudsShadowTex3D.SampleLevel(
+				gBilinearClampSampler, uvw.xzy, 0).y;
+			float cloudFactor = 1.0 - cloudOcclusion;
+			effectiveAngularDiameter = PCSS_SUN_ANGULAR_DIAMETER
+				+ PCSS_CLOUD_ANGULAR_DIAMETER * cloudFactor * cloudFactor;
+		}
 
 		// ── Phase 1: Wide Vogel-disk blocker search ─────────────────
 		// The search radius must reach far enough to find occluders
@@ -273,20 +294,20 @@ float SampleShadowMap(float3 wPos, float NoL, uniform uint idx, uniform bool use
 		// 64 texels at the search mip level covers substantial area.
 		float refZ = shadowCoord.z + bias * 2.0;
 
-		// Reconstruct receiver world depth within cascade for adaptive
-		// search sizing.  Use the world-space distance along gSunDir
-		// from cascade near plane.
-		float4 nearPlaneWorld = mul(
-			float4(shadowPos.xy, 0.0, 1.0),
-			ShadowMatrixInv[idx]);
-		float receiverCascadeDepth = dot(
-			wPos - nearPlaneWorld.xyz / nearPlaneWorld.w, gSunDir);
-		receiverCascadeDepth = max(receiverCascadeDepth, 1.0);
+		// Receiver distance from cascade near plane (meters).
+		// In reversed-Z, z=1.0 is near plane (closest to light).
+		// (1.0 - shadowCoord.z) gives normalized depth from near plane;
+		// dividing by zPerMeter converts to world-space meters.
+		// This is how far above the receiver blockers could exist.
+		float receiverCascadeDepth = max(
+			(1.0 - shadowCoord.z) / max(abs(zPerMeter), 1e-6), 1.0);
 
 		// Adaptive search radius in texels.
-		float searchWorld = receiverCascadeDepth * PCSS_SUN_ANGULAR_DIAMETER;
+		// Halved: search covers the maximum one-sided penumbra reach,
+		// not the full penumbra width.
+		float searchWorld = receiverCascadeDepth * effectiveAngularDiameter * 0.5;
 		float searchTexels = searchWorld * texelsPerMeter;
-		searchTexels = min(searchTexels, 64.0 * max(1.0, (float)(1 << PCSS_BLOCKER_SEARCH_MIP)));
+		searchTexels = min(searchTexels, 64.0);
 		float searchRadius = searchTexels / ShadowMapSize;
 
 		// Vogel-disk blocker search with configurable mip level.
@@ -318,7 +339,7 @@ float SampleShadowMap(float3 wPos, float NoL, uniform uint idx, uniform bool use
 			float sd = cascadeShadowMap.SampleLevel(
 				gPointClampSampler,
 				float3(shadowCoord.xy + searchDelta, 3 - idx),
-				PCSS_BLOCKER_SEARCH_MIP).x;
+				0).x;
 
 			if (sd > refZ)
 			{
@@ -337,19 +358,23 @@ float SampleShadowMap(float3 wPos, float NoL, uniform uint idx, uniform bool use
 		{
 			float avgBlockerDepth = blockerSum / blockerCount;
 
-			// Reconstruct world-space blocker distance.
-			float4 blockerWorld = mul(
-				float4(shadowPos.xy, avgBlockerDepth, 1.0),
-				ShadowMatrixInv[idx]);
-			float blockerDist = dot(
-				blockerWorld.xyz / blockerWorld.w - wPos, gSunDir);
+			// Blocker distance in meters via linear depth scale.
+			// In reversed-Z, blocker (closer to light) has larger z
+			// than receiver.  Dividing the depth difference by zPerMeter
+			// gives world-space distance.  Replaces the expensive
+			// ShadowMatrixInv reconstruction.
+			float blockerDist = (avgBlockerDepth - shadowCoord.z)
+				/ max(abs(zPerMeter), 1e-6);
 
 			if (blockerDist > PCSS_MIN_BLOCKER_DIST)
 			{
-				// Physical penumbra in texels.
+				// Physical penumbra RADIUS in texels (half the full width).
+				// The angular diameter formula gives the full lit-to-umbra
+				// transition width; PCF radius is half that.
 				float penumbraTexels = blockerDist
-					* PCSS_SUN_ANGULAR_DIAMETER
-					* texelsPerMeter;
+					* effectiveAngularDiameter
+					* texelsPerMeter
+					* 0.5;
 
 #if PCSS_RADIUS_OVERDRIVE > 0
 				// Clamped mode: limit radius to overdrive * clean fill.
@@ -422,8 +447,8 @@ float2 SampleShadowClouds(float3 pos)
 		float3 uvw = pos * gCloudVolumeScale + gCloudVolumeOffset;
 		float2 s = cloudsShadowTex3D.SampleLevel(gBilinearClampSampler, uvw.xzy, 0).yx;
 		if(uvw.y>1) s = 1;
-		float extinctionScale = 6.0;
-		s.x = exp(-extinctionScale * (1.0 - s.x));
+		float extinctionScale = 4.0;
+		s.x = min(s.x, exp(-extinctionScale * (1.0 - s.x)));
 		s.x = min(s.x, getFogTransparency(ProjectOriginSpaceToSphere(pos).y + gOrigin.y, gSunDir.y, 400000.0f));
 		return s;
 	}
@@ -443,42 +468,31 @@ float SampleShadowCascade(float3 wPos, float depth, float3 normal, uniform bool 
 		NoL = dot(normal, gSunDir.xyz);
 		if (NoL < 0)
 			return 0;
-
-		// ── Normal offset bias ──────────────────────────────────
-		// Shift the shadow lookup position along the surface normal.
-		// At grazing sun angles (low NoL), shadow map texels stretch
-		// across the surface and self-intersection is severe.  The
-		// offset lifts the lookup point above the surface, preventing
-		// the shadow map from seeing the receiver as its own occluder.
-		//
-		// At perpendicular sun angles (NoL near 1), the offset is
-		// near zero -- no correction needed, no shadow detachment.
-		//
-		// This is applied to wPos before all cascade lookups so every
-		// cascade benefits from the same geometric correction.
-		wPos += normal * PCSS_NORMAL_OFFSET_SCALE * (BASE_SHADOWMAP_SIZE / ShadowMapSize) * (1.0 - NoL);
 	}
 
+	// Normal offset is now applied per-cascade inside SampleShadowMap
+	// where texelsPerMeter is known, making it cascade-invariant.
+
 	if (useOnlyFirstMap) {
-		return SampleShadowMap(wPos, NoL, ShadowFirstMap, usePCF, PCSS_TAPS_CASCADE_3, false, PCSS_FLOOR_CASCADE_3);
+		return SampleShadowMap(wPos, normal, NoL, ShadowFirstMap, usePCF, PCSS_TAPS_CASCADE_3, false, PCSS_FLOOR_CASCADE_3);
 	} else {
 		// DCS cascade numbering: 0 = farthest, 3 = nearest.
 		// ShadowDistance[0] is the farthest boundary,
 		// ShadowDistance[3] is the nearest.
 		if (depth > ShadowDistance[0])
-			return SampleShadowMap(wPos, NoL, 0, usePCF, PCSS_TAPS_CASCADE_0, useTreeShadow, PCSS_FLOOR_CASCADE_0);
+			return SampleShadowMap(wPos, normal, NoL, 0, usePCF, PCSS_TAPS_CASCADE_0, useTreeShadow, PCSS_FLOOR_CASCADE_0);
 
 		if (depth > ShadowDistance[1])
-			return SampleShadowMap(wPos, NoL, 1, usePCF, PCSS_TAPS_CASCADE_1, useTreeShadow, PCSS_FLOOR_CASCADE_1);
+			return SampleShadowMap(wPos, normal, NoL, 1, usePCF, PCSS_TAPS_CASCADE_1, useTreeShadow, PCSS_FLOOR_CASCADE_1);
 
 		if (depth > ShadowDistance[2])
-			return SampleShadowMap(wPos, NoL, 2, usePCF, PCSS_TAPS_CASCADE_2, useTreeShadow, PCSS_FLOOR_CASCADE_2);
+			return SampleShadowMap(wPos, normal, NoL, 2, usePCF, PCSS_TAPS_CASCADE_2, useTreeShadow, PCSS_FLOOR_CASCADE_2);
 
 		if (depth > ShadowDistance[3]) {
 			if (useTreeShadow)
-				return max(SampleShadowMap(wPos, NoL, 3, usePCF, PCSS_TAPS_CASCADE_3, true, PCSS_FLOOR_CASCADE_3), smoothstep(ShadowDistance[2], ShadowDistance[3], depth));
+				return max(SampleShadowMap(wPos, normal, NoL, 3, usePCF, PCSS_TAPS_CASCADE_3, true, PCSS_FLOOR_CASCADE_3), smoothstep(ShadowDistance[2], ShadowDistance[3], depth));
 			else
-				return max(SampleShadowMap(wPos, NoL, 3, usePCF, PCSS_TAPS_CASCADE_3, false, PCSS_FLOOR_CASCADE_3), smoothstep(ShadowCascadeFadeDepth, ShadowDistance[3], depth));
+				return max(SampleShadowMap(wPos, normal, NoL, 3, usePCF, PCSS_TAPS_CASCADE_3, false, PCSS_FLOOR_CASCADE_3), smoothstep(ShadowCascadeFadeDepth, ShadowDistance[3], depth));
 		}
 		return 1;
 	}
