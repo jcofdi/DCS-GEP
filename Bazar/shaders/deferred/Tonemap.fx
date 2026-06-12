@@ -175,9 +175,58 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 	// Stock bloom composite (lerp-based)
 	float3 linearColor = lerp(sceneColor, bloom, 0.07) * exposure;
 
-	if(whiteBalanceFactor>0)
+	// =====================================================================
+	// GEP: Pre-curve color grading (Hable chain)
+	// =====================================================================
+	// Positioned before Purkinje so scotopic desaturation correctly
+	// rolls back the daytime boost at night, and before dirt/vignette
+	// so optical artifacts aren't graded as scene content.
+	//
+	// Log-space contrast redistributes tonal energy around middle
+	// grey (0.18) without clipping.
+	//
+	// Zone-weighted pre-curve saturation compensates for the shadow
+	// saturation that a per-channel toe would add for free — GEP's
+	// luminance-based toe preserves hue but foregoes that boost.
+	// Shadows get the most compensation, midtones moderate, highlights
+	// none (the per-channel shoulder handles desaturation naturally).
+	//
+	// Defaults: logContrast 1.0, saturation factors 1.0 = no-op
+	// (compiler eliminates the block).
+	if(!(flags & TONEMAP_FLAG_CUSTOM_FILTER))
 	{
-		linearColor /= lerp(1, AmbientWhitePoint, whiteBalanceFactor);
+		static const float logContrast = 1.05;
+
+		// --- Log-space contrast around middle grey ---
+		if(logContrast != 1.0)
+		{
+			static const float eps    = 1e-6;
+			static const float logMid = -2.474; // log2(0.18)
+			linearColor.r = max(0, exp2(logMid + (log2(linearColor.r + eps) - logMid) * logContrast) - eps);
+			linearColor.g = max(0, exp2(logMid + (log2(linearColor.g + eps) - logMid) * logContrast) - eps);
+			linearColor.b = max(0, exp2(logMid + (log2(linearColor.b + eps) - logMid) * logContrast) - eps);
+		}
+
+		// --- Zone-weighted pre-curve saturation ---
+		// Shadow/mid/highlight zones with smooth crossfade.
+		// Transition points in post-exposure linear space:
+		//   shadow -> midtone:  0.0 – 0.25 (~1 stop below middle grey)
+		//   midtone -> highlight: 0.5 – 1.5 (~1 stop above middle grey)
+		{
+			static const float satShadow = 1.15;
+			static const float satMid    = 1.10;
+			static const float satHigh   = 1.00;
+
+			static const float3 satW = float3(0.333, 0.333, 0.334);
+			float grey = dot(linearColor, satW);
+
+			float shadow    = 1.0 - smoothstep(0.0, 0.25, grey);
+			float highlight = smoothstep(0.5, 1.5, grey);
+			float midtone   = 1.0 - shadow - highlight;
+
+			float satFactor = shadow * satShadow + midtone * satMid + highlight * satHigh;
+			linearColor = max(0, grey + satFactor * (linearColor - grey));
+		}
 	}
 
 	// --- GEP: Purkinje effect (scotopic vision color shift) ---
@@ -204,8 +253,16 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 	if(flags & TONEMAP_FLAG_DIRT_EFFECT)
 	{
 		float NoL = dot(gSunDir, normalize(i.worldPos.xyz - gCameraPos.xyz));
-		float effectMask = 0.2 + 0.15 * pow(max(0, NoL), 10);//towards the Sun
-		linearColor += lensDirtTex.SampleLevel(gBilinearClampSampler, i.projPos.xy, 0).rgb * bloom * effectMask;
+		float effectMask = 0.2 + 0.15 * pow(max(0, NoL), 10);
+		
+		// GEP: Compensate for threshold-free bloom.
+		// Stock bloom only carried energy above bloomThreshold, so the
+		// dirt mask was calibrated for a sparse signal. Re-apply the
+		// threshold gate to the composited bloom for dirt purposes only.
+		float bloomLum = dot(bloom, 0.333);
+		float dirtGate = saturate((bloomLum - bloomThreshold) * 0.5);
+		
+		linearColor += lensDirtTex.SampleLevel(gBilinearClampSampler, i.projPos.xy, 0).rgb * bloom * effectMask * dirtGate;
 	}
 
 	if(vignetteFactor>0)
@@ -241,7 +298,7 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 		float gradingFactor = 1.0;
 		screenColor = lerp(screenColor, ColorGrade(screenColor, uv/pixelSize), gradingFactor);
 	}
-
+	
 	debugDraw(i.projPos.xy, uv, screenColor);
 
 #ifdef DRAW_FOCUS
