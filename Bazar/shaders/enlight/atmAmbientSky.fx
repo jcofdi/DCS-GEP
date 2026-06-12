@@ -418,10 +418,16 @@ void ComputeSunColor(uint id: SV_GroupIndex, uint3 gId: SV_GroupID, uint3 tId: S
 	const float altitudeMax = 20.0;//km
 
 	TexelParameters i = getParametersFromTexel(dId.xy, texSize.xy, altitudeMax, distanceRange);
-
+	
 	float3 sunRad = GetTotalSunRadiance(i.altitude, i.muS);
-    sunRad *= 0.80;  // reduce sun contribution to clouds
-    texOutput[dId.xy] = float4(sunRad, 0);
+
+	// Altitude-dependent boost: cloud tops get more energy
+	// Cloud base (~1.5km) gets standard sun, cloud top (~4km) gets boosted
+	float altBoost = lerp(1.0, 1.8, smoothstep(1.5, 5.0, i.altitude));
+	sunRad *= 0.80 * altBoost;
+	
+	texOutput[dId.xy] = float4(sunRad, 5.0);
+
 }
 
 struct AerialParameters
@@ -452,6 +458,11 @@ void ComputeAerialTransmittance(uint id: SV_GroupIndex, uint3 gId: SV_GroupID, u
 {	
 	AerialParameters i = getAerialParametersFromTexel(dId.xyz, texSize, gViewProjInv);
 
+	// DIAGNOSTIC: Force aerial inscatter to red
+	tex3DOutput[dId.xyz] = float4(5.0, 0.0, 0.0, 0);
+	tex3DOutput2[dId.xyz] = float4(0.0, 5.0, 0.0, 0);
+	return;
+	
 	float3 cameraPos = gEarthCenter + float3(0, heightHack, 0);
 	float3 transmittance;
 	float3 inscatterColor = GetSkyRadianceToPoint(cameraPos, cameraPos + i.dir * i.dist*0.001, 0.0/*shadow*/, gSunDir, transmittance);
@@ -502,7 +513,32 @@ void ComputeAerialTransmittance(uint id: SV_GroupIndex, uint3 gId: SV_GroupID, u
 	float3 clampedInscatter = inscatterColor * clampFactor;
 
 	tex3DOutput[dId.xyz]  = float4(clampedInscatter * gAtmIntensity * cloudAerialFactor, 0);
-	tex3DOutput2[dId.xyz] = float4(lerp(1.0, transmittance, cloudAerialFactor), 0);
+
+	// [MOD] Phase function compensation for multiply-scattered clouds.
+	//
+	// The C++ raymarcher applies a single-scatter Mie phase function with
+	// strong forward-scatter asymmetry (~6:1 forward/back ratio). Real
+	// thick clouds undergo 5-10+ scattering events that isotropize the
+	// angular distribution, producing a physical ratio closer to 2:1.
+	//
+	// This post-correction modifies the transmittance output (which is
+	// multiplicative on cloud color) to counteract the excess asymmetry:
+	//   - Looking away from sun (backscatter, cloud tops from above):
+	//     boost brightness to compensate for underestimated backscatter
+	//   - Looking toward sun (forward scatter, cloud edges from below):
+	//     reduce brightness to compensate for overestimated forward peak
+	//
+	// cosTheta: +1.0 = looking toward sun, -1.0 = looking away from sun
+	float cosTheta = dot(i.dir, gSunDir);
+	float phaseCorrection = lerp(1.6, 0.75, saturate(cosTheta * 0.5 + 0.5));
+
+	// Gate to cloud-relevant distances only (> 1km)
+	float cloudRange = smoothstep(1.0, 5.0, i.dist * 0.001);
+
+	float3 correctedTransmittance = lerp(1.0, transmittance, cloudAerialFactor);
+	correctedTransmittance *= lerp(1.0, phaseCorrection, cloudRange);
+
+	tex3DOutput2[dId.xyz] = float4(correctedTransmittance, 0);
 }
 
 technique10 tech
@@ -521,7 +557,7 @@ technique10 tech
 	}
 	pass aerialScattering
 	{
-		// SetComputeShader(CompileShader(cs_5_0, ComputeAerialTransmittance()));
+		SetComputeShader(CompileShader(cs_5_0, ComputeAerialTransmittance()));
 	}
 	// pass fogColorTable
 	// {
