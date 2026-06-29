@@ -243,7 +243,7 @@ float waterSpecular(float3 V, float3 N, float NoV, float roughness, float windMa
 // Scatter and refracted color are now gated by (1 - fresnel) so that the
 // transmitted fraction + reflected fraction never exceeds the incident energy.
 // Previously scatter was added unconditionally before Fresnel blending.
-float3 waterShading(float3 pos, float4 viewDir, float3 normal, float3 color, float3 reflection_color, float shadow, float foam, float3 sunLight, float riverLerp) {
+float3 waterShading(float3 pos, float4 viewDir, float3 normal, float3 color, float3 reflection_color, float shadow, float foam, float isWake, float3 sunLight, float riverLerp) {
 
 	float2 cloudShadowAO = SampleShadowClouds(pos);
 	float roughness = lerp(0.5, 0.1, max(cloudShadowAO.x, cloudShadowAO.y));
@@ -294,7 +294,7 @@ float3 waterColorDraft(float3 normal, float3 pos) {
 	float3 sunLight = getSunLight(pos);
 	float3 color = getDeepColor(0)*sunLight;
 
-	return waterShading(pos, float4(viewDir, distance), normal, color, reflection_color, 1, 0, sunLight, 0);
+	return waterShading(pos, float4(viewDir, distance), normal, color, reflection_color, 1, 0, 0, sunLight, 0);
 }
 
 
@@ -373,7 +373,7 @@ float3 waterColorForAmbientCube(float3 viewDir, float3 normal) {
 	float3 wpos = float3(gCameraPos.x, g_Level - gOrigin.y, gCameraPos.y);
 	float3 sunLight = getSunLight(wpos);
 	float3 color = getDeepColor(0)*sunLight;
-	return color * 1.5; // [MOD] was 4.5
+	return color * 1.33; // [MOD] was 4.5
 }
 
 float _waterDeep(float wPosY)			{ return -(wPosY + gOrigin.y - g_Level); }
