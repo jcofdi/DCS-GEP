@@ -418,12 +418,12 @@ void ComputeSunColor(uint id: SV_GroupIndex, uint3 gId: SV_GroupID, uint3 tId: S
 	const float altitudeMax = 20.0;//km
 
 	TexelParameters i = getParametersFromTexel(dId.xy, texSize.xy, altitudeMax, distanceRange);
-	
+
 	float3 sunRad = GetTotalSunRadiance(i.altitude, i.muS);
 
 	// Altitude-dependent boost: cloud tops get more energy
 	// Cloud base (~1.5km) gets standard sun, cloud top (~4km) gets boosted
-	float altBoost = lerp(1.0, 1.8, smoothstep(1.5, 5.0, i.altitude));
+	float altBoost = lerp(1.0, 1.8, smoothstep(1.5, 3.0, i.altitude));
 	sunRad *= 0.80 * altBoost;
 	
 	texOutput[dId.xy] = float4(sunRad, 5.0);
@@ -457,11 +457,6 @@ AerialParameters getAerialParametersFromTexel(uint3 texel, float3 texSize, float
 void ComputeAerialTransmittance(uint id: SV_GroupIndex, uint3 gId: SV_GroupID, uint3 tId: SV_GroupThreadID, uint3 dId: SV_DispatchThreadID)
 {	
 	AerialParameters i = getAerialParametersFromTexel(dId.xyz, texSize, gViewProjInv);
-
-	// DIAGNOSTIC: Force aerial inscatter to red
-	tex3DOutput[dId.xyz] = float4(5.0, 0.0, 0.0, 0);
-	tex3DOutput2[dId.xyz] = float4(0.0, 5.0, 0.0, 0);
-	return;
 	
 	float3 cameraPos = gEarthCenter + float3(0, heightHack, 0);
 	float3 transmittance;
