@@ -119,8 +119,8 @@ void applyARPCOverrides(inout AtmosphereParameters atmosphere)
 	//   60 km horizontal at sea level: transmittance ~0.49 (51% contrast loss)
 	//   80 km horizontal at sea level: transmittance ~0.38 (62% contrast loss)
 	//   60 km to a 3 km peak: transmittance ~0.92 (peak mostly clear)
-	static const float supplementaryMieExt = 0.012;
-	static const float supplementaryMieSSA = 0.80;
+	static const float supplementaryMieExt = 0.031;
+	static const float supplementaryMieSSA = 0.90;
 	atmosphere.mie_scale_height *= 1.5;
 	atmosphere.mie_extinction += supplementaryMieExt;
 	atmosphere.mie_scattering += supplementaryMieExt * supplementaryMieSSA;
