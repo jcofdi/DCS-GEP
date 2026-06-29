@@ -9,7 +9,14 @@
 
 #define USE_ROTATE_PCF 1
 #define BASE_SHADOWMAP_SIZE 4096
-#define BASE_SHADOWMAP_BIAS 0.0002
+// ── Shadow bias (the tuning knob) ───────────────────────────────────
+// Production was 0.0002. Set HIGH here to over-correct: this should
+// eliminate acne outright (with visible peter-panning) as the top of
+// the step-down. Once acne is confirmed gone, walk it down and stop at
+// the balance point. With geometric-normal dzdUV ON, the landing value
+// should be far below the flat-only "absurd" number.
+//   Step-down ladder:  0.0040 -> 0.0020 -> 0.0010 -> 0.0005 -> 0.0003
+#define BASE_SHADOWMAP_BIAS 0.0025
 
 // ── Texel-proportional normal offset bias ───────────────────────────
 // Cascade-invariant acne prevention.  Offsets the shadow lookup point
@@ -31,7 +38,25 @@
 //   2.0 = recommended starting point
 //   3.0 = aggressive (eliminates most acne, mild shadow rounding)
 //   4.0 = very aggressive (visible shadow rounding at grazing)
-#define PCSS_NORMAL_OFFSET_TEXELS 4.0
+#define PCSS_NORMAL_OFFSET_TEXELS 1.0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SHADOW ACNE TUNING CONFIG
+//
+// Geometric normal (compose) feeds dzdUV, which applies the EXACT receiver
+// plane per tap -- it has no strength knob, it is on or off. The thing you
+// tune is BASE_SHADOWMAP_BIAS below: it clears the residual (curvature +
+// texel quantization) that dzdUV cannot. Start high to over-correct, then
+// step it down to the balance point where acne is gone and peter-panning is
+// acceptable. The three confounders are OFF so the bias number you read is
+// clean and the peter-panning is visible (the ramp would hide it).
+//
+// To return to production after tuning: set the three OFF flags to 1.
+#define GEP_USE_DZDUV            1    // ON: receiver-plane gradient, geom-normal fed
+#define GEP_USE_NORMAL_OFFSET    0    // restore: 1  (off: confounds the bias reading)
+#define GEP_USE_GRAZING_CLAMP    0    // restore: 1  (off: would modulate apparent acne)
+#define GEP_SHADOW_GEOM_NORMAL   1    // ON: clean normal into dzdUV (consumed in compose)
+// ═══════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════
 // [MOD] PCSS -- Percentage Closer Soft Shadows with Vogel Disk Sampling
@@ -125,6 +150,25 @@
 // Cascade 0 (outermost, farthest camera): lowest density.
 #define PCSS_TAPS_CASCADE_0 16
 
+// ── Dynamic PCF tap count ───────────────────────────────────────────
+// The per-cascade budgets above are sized to cleanly FILL the maximum
+// penumbra radius that cascade can produce. But most pixels resolve to
+// a radius at or near the floor (full-lit, umbra interior, sharp
+// contact), where a fraction of the budget already fills the disk.
+// When enabled, the actual tap count scales to the radius we ended up
+// with -- full budget only where a wide penumbra genuinely opened up.
+//
+// Quality-neutral by construction: the relation N = pi*R^2/4 is the
+// inverse of maxCleanRadius = sqrt(N*4/pi), so dynCount is exactly the
+// taps needed to fill the realized radius with no gaps. Taps removed
+// were filling disk area that does not exist at this radius.
+//
+// PCSS_MIN_PCF_TAPS: floor so even floor-radius disks keep enough taps
+// for stable blue-noise dithering and rim definition. Do not set below
+// ~8 or sparse-disk dither structure can become visible.
+#define PCSS_DYNAMIC_TAPS 1     // 0 = static full budget (A/B baseline)
+#define PCSS_MIN_PCF_TAPS 8
+
 // Per-cascade PCF floor (in texels).  Minimum filter radius when PCSS
 // produces a physical penumbra smaller than this value.  Directly
 // controls contact shadow sharpness and staircase dissolution.
@@ -175,6 +219,17 @@
 // triggering false penumbrae on flat surfaces.
 #define PCSS_MIN_BLOCKER_DIST 0.1
 
+// Terminator ramp width.  saturate(NoL * k) darkens the shadow return
+// over NoL in [0, 1/k], hiding peter-pan detachment in the dim sliver
+// just before the terminator.  k is 1 / (band width in NoL):
+//   k=4  -> ramp completes at NoL 0.25 (~75.5 deg off light) -- wide
+//   k=8  -> NoL 0.125 (~82.8 deg)
+//   k=10 -> NoL 0.1   (~84.3 deg) -- narrow, DCS-shipped value
+// Higher k confines the darkening to surfaces nearly edge-on to the
+// sun (almost no direct flux), so it hides peter-panning while
+// stealing the least light from surfaces that should still read as lit.
+#define PCSS_TERMINATOR_RAMP_K 10.0
+
 // ── Blocker search configuration ────────────────────────────────────
 // The blocker search must reach far enough to find occluders for
 // lit-side pixels near the shadow boundary.  Without sufficient reach,
@@ -187,7 +242,23 @@
 //
 #define PCSS_BLOCKER_SEARCH_TAPS 16
 
-
+// ── Grazing curvature clamp ─────────────────────────────────────────
+// Curved receivers (fuselages) always present a grazing band to the
+// sun -- a locus where NoL is small -- and the band migrates around
+// the surface as the sun moves.  In that band the shadow-map footprint
+// stretches ~1/NoL, so the PCF disk covers a long strip of curving
+// surface; the planar dzdUV approximation is only first-order, and its
+// error grows with radius^2.  Capping the penumbra radius toward the
+// per-cascade floor as NoL falls keeps that error bounded.
+//
+// Keys on NoL, which tolerates a noisy (shading) normal far better than
+// dzdUV does: a normal error here only perturbs the disk radius
+// slightly, it cannot flip a tap lit/shadowed.  This is why the clamp
+// is robust where the geometric reconstruction was not.
+//
+// NOL_FULL: NoL at/above which no restriction is applied.
+// At NoL >= NOL_FULL the existing overdrive cap is used unchanged.
+#define PCSS_GRAZING_NOL_FULL 0.5
 
 float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, uniform bool usePCF, uniform uint samplesMax, uniform bool useTreeShadow, uniform float floorRadius = 1.5)
 {
@@ -214,19 +285,39 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 	float zPerMeter = mul(float4(gSunDir.xyz, 0.0), ShadowMatrix[idx]).z;
 
 	// ── Texel-proportional normal offset ────────────────────────
-	// Offset along the surface normal by a fixed number of shadow
-	// texels.  Cascade-invariant: inner cascades (high density) get
-	// a small world-space push, outer cascades (low density) get a
-	// large one.  Normal-map bump noise at ~5% creates ~0.1 texels
-	// of variation -- sub-texel, invisible.
+	// Small offset along the surface normal for curvature and
+	// geometric-vs-rasterized normal mismatch.  Slope clearance is
+	// now handled by the per-tap receiver-plane gradient below.
+	// tan(angle) scaling matches the geometric self-occlusion depth.
+	// [TEST] gated: nulled for clean flat-bias isolation.
+#if GEP_USE_NORMAL_OFFSET
 	if (NoL < 1.0)
 	{
 		float metersPerTexel = 1.0 / max(texelsPerMeter, 1.0);
-		wPos += normal * (PCSS_NORMAL_OFFSET_TEXELS * metersPerTexel) * (1.0 - NoL);
+		float sinAngle = sqrt(1.0 - NoL * NoL);
+		float tanAngle = min(sinAngle / max(NoL, 0.05), 5.0);
+		wPos += normal * (PCSS_NORMAL_OFFSET_TEXELS * metersPerTexel) * tanAngle;
 		shadowPos = mul(float4(wPos, 1.0), ShadowMatrix[idx]);
 	}
+#endif
 
 	float3 shadowCoord = shadowPos.xyz / shadowPos.w;
+
+	// ── Receiver-plane gradient in shadow space ─────────────────
+	// Projects the surface normal into shadow space to get the depth
+	// gradient per shadow UV, so each PCF / search tap compares
+	// against the receiver surface depth at its offset position.
+	// [TEST] gated: when off, dzdUV = 0 -> every tap compares against
+	// the center depth (standard PCF), leaving flat bias as the sole
+	// clearance term. Fed by the geometric normal when re-enabled
+	// (compose GEP_SHADOW_GEOM_NORMAL).
+#if GEP_USE_DZDUV
+	float3 nS = mul(float4(normal, 0.0), ShadowMatrix[idx]).xyz;
+	float2 dzdUV = -nS.xy / max(abs(nS.z), 0.1);
+#else
+	float2 dzdUV = float2(0.0, 0.0);
+#endif
+
 	float acc = cascadeShadowMap.SampleCmpLevelZero(gCascadeShadowSampler, float3(shadowCoord.xy, 3 - idx), saturate(shadowCoord.z) + bias);
 
 	if (useTreeShadow) {
@@ -292,7 +383,7 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 		// Practical cap: the search radius is clamped to prevent
 		// extreme cost at very deep receivers or high density.
 		// 64 texels at the search mip level covers substantial area.
-		float refZ = shadowCoord.z + bias * 2.0;
+		// refZ is no longer used -- replaced by per-tap planeZ below.
 
 		// Receiver distance from cascade near plane (meters).
 		// In reversed-Z, z=1.0 is near plane (closest to light).
@@ -341,7 +432,14 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 				float3(shadowCoord.xy + searchDelta, 3 - idx),
 				0).x;
 
-			if (sd > refZ)
+			// Plane-relative blocker test: compare against the
+			// receiver surface depth at the tap position, not the
+			// center depth.  Prevents the receiver's own slope from
+			// registering as a blocker (the self-detection feedback
+			// loop that manufactured wide PCSS disks on unshadowed
+			// slopes).
+			float planeZ = shadowCoord.z + dot(searchDelta, dzdUV);
+			if (sd > planeZ + bias * 2.0)
 			{
 				// Center-weighted: blockers closer to the pixel center
 				// are more relevant to this pixel's penumbra than those
@@ -359,10 +457,11 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 			float avgBlockerDepth = blockerSum / blockerCount;
 
 			// Blocker distance in meters via linear depth scale.
-			// In reversed-Z, blocker (closer to light) has larger z
-			// than receiver.  Dividing the depth difference by zPerMeter
-			// gives world-space distance.  Replaces the expensive
-			// ShadowMatrixInv reconstruction.
+			// Measured as height above the receiver PLANE (not the
+			// center point), which is the correct occluder distance
+			// for sloped receivers.  The weighted blocker depth from
+			// the search already excludes the receiver's own slope
+			// via plane-relative classification.
 			float blockerDist = (avgBlockerDepth - shadowCoord.z)
 				/ max(abs(zPerMeter), 1e-6);
 
@@ -391,7 +490,34 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 		}
 #endif // PCSS_ENABLE
 
+		// ── Grazing curvature clamp ─────────────────────────────────
+		// Scale the allowed maximum penumbra from the floor (full
+		// grazing) up to the full computed radius (NoL >= NOL_FULL).
+		// min() ensures this only ever restricts; max(.,floorRadius)
+		// guarantees a soft floor so the band never aliases to a hard
+		// edge.  Removing the restriction is NoL >= NOL_FULL -> grazeMax
+		// >= pcssR -> min() is a no-op.
+		// [TEST] gated: nulled so penumbra width does not interact with
+		// the bias sweep.
+#if GEP_USE_GRAZING_CLAMP
+		float grazeT  = saturate(NoL / PCSS_GRAZING_NOL_FULL);
+		float grazeMax = lerp(floorRadius, pcssR, grazeT);
+		pcssR = max(min(pcssR, grazeMax), floorRadius);
+#endif // GEP_USE_GRAZING_CLAMP
+
 		const float radius = pcssR / ShadowMapSize;
+
+		// ── Dynamic tap count ───────────────────────────────────────
+		// Taps needed to cleanly fill the realized radius (texels):
+		// inverse of maxCleanRadius = sqrt(count*4/pi). Clamped to the
+		// dither floor and the per-cascade budget ceiling. When the knob
+		// is off, dynCount == count (original static behavior).
+#if PCSS_DYNAMIC_TAPS
+		uint dynCount = (uint)ceil(pcssR * pcssR * PI_VAL * 0.25);
+		dynCount = clamp(dynCount, (uint)PCSS_MIN_PCF_TAPS, count);
+#else
+		uint dynCount = count;
+#endif
 
 		// ── Rim-biased Vogel disk PCF ───────────────────────────────
 		// Golden-angle spiral with configurable radial distribution for
@@ -403,9 +529,9 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 		// Lower exponents push taps toward the rim where the penumbra
 		// transition lives, defining the edge more cleanly.
 		//
-		// Acne prevention is handled by normal offset bias applied
-		// upstream in SampleShadowCascade.  Per-tap depth uses a simple
-		// constant bias for residual quantization noise.
+		// Acne prevention: per-tap comparison depth tracks the receiver
+		// surface plane via dzdUV.  Normal offset handles curvature.
+		// Constant bias handles residual depth quantization.
 		float baseAngle = 0;
 #if USE_ROTATE_PCF
 		// Blue noise rotation: decorrelates adjacent pixels more cleanly
@@ -417,9 +543,13 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 		baseAngle = ditherBlueNoiseComputed(noisePix) * (2.0 * PI_VAL);
 #endif
 		// Start from i=1 because i=0 is the center tap already in acc.
+		// Loop bound, radial normalization (t), and the final divide ALL
+		// use dynCount so the Vogel spiral fills the full radius with the
+		// reduced count -- normalizing t by anything else would pack taps
+		// into the inner disk and leave the rim (the penumbra) unsampled.
 		[loop]
-		for (uint i = 1; i < count; ++i) {
-			float t = ((float)i + 0.5) / (float)count;
+		for (uint i = 1; i < dynCount; ++i) {
+			float t = ((float)i + 0.5) / (float)dynCount;
 			float angle = baseAngle + (float)i * goldenAngle;
 
 			float s, c;
@@ -428,15 +558,26 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 			// Rim-biased Vogel: exponent < 0.5 pushes taps outward.
 			float2 delta = float2(c, s) * (pow(t, PCSS_RIM_BIAS_EXPONENT) * radius);
 
+			// Plane-relative depth: each tap compares against the
+			// receiver surface depth at its offset position, not the
+			// center depth.  Eliminates slope self-shadowing at any
+			// filter radius -- the clearance scales automatically
+			// with the tap distance from center.
+			float tapDepth = saturate(shadowCoord.z + dot(delta, dzdUV)) + bias;
+
 			acc += cascadeShadowMap.SampleCmpLevelZero(
 				gCascadeShadowSampler,
 				float3(shadowCoord.xy + delta, 3 - idx),
-				saturate(shadowCoord.z) + bias);
+				tapDepth);
 		}
-		acc /= count;
+		acc /= dynCount;
 	}
-	// return saturate(min(NoL * 10, acc));
-	return saturate(acc);
+	// Gentle terminator ramp: at extreme grazing, residual peter-pan
+	// detachment from the shipping bias is visible.  The ramp darkens
+	// the shadow return in the dim sliver just before the terminator,
+	// hiding the detachment without stealing light from surfaces that
+	// still read as lit.  Width set by PCSS_TERMINATOR_RAMP_K.
+	return saturate(acc) * saturate(NoL * PCSS_TERMINATOR_RAMP_K);
 }
 
 //return shadow + AO
