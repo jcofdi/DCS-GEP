@@ -138,7 +138,7 @@ float3 ShadeSolidCockpitGI(float3 sunColor, float3 diffuseColor, float3 specular
 	}
 
 	// LUT-calibrated specular occlusion (see ShadeSolid for derivation)
-	float specOcc = saturate(pow(NoV + fadedAO, Ess) - 1.0 + fadedAO);
+	float specOcc = saturate(pow(NoV + fadedAO, exp2(-16.0 * roughness - 1.0)) - 1.0 + fadedAO);
 	specOcc = max(specOcc, 0.08);
 
 	float3 mbSpecOcc = MultiBounceSpecOcc(specOcc, specularColor);
@@ -246,7 +246,7 @@ float3 ShadeSolidCockpit(float3 sunColor, float3 diffuseColor, float3 specularCo
 	}
 
 	// LUT-calibrated specular occlusion (see ShadeSolid for derivation)
-	float specOcc = saturate(pow(NoV + fadedAO, Ess) - 1.0 + fadedAO);
+	float specOcc = saturate(pow(NoV + fadedAO, exp2(-16.0 * roughness - 1.0)) - 1.0 + fadedAO);
 	specOcc = max(specOcc, 0.08);
 
 	float3 mbSpecOcc = MultiBounceSpecOcc(specOcc, specularColor);
