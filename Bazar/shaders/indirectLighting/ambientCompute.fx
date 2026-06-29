@@ -67,6 +67,17 @@ static const float3 binormals[] = {
 static const float	isSideWall[] = { 1, 1, 0, 0, 1, 1 };
 static const float3 lumCoef =  {0.2125f, 0.7154f, 0.0721f};
 
+// [MOD] Circumsolar exclusion for the ambient probe (split-sum convention).
+// The env-cube pass renders GetSkyRadiance, whose Cornette-Shanks Mie forward
+// lobe (g~0.8) is intense in the circumsolar cone. Sampled at mip 4 it smears
+// across ~+/-15-20 deg, so a sun-facing wall reads far brighter than the
+// diffuse sky it should represent — handing shadowed sun-facing surfaces
+// "sunlit" ambient. The disc + aureole are accounted by the analytic direct
+// term; counting them here double-counts direct light into ambient. Cone is
+// sized for the mip-4 smear, not the physical aureole (~5 deg).
+static const float SUN_EXCL_COS_INNER = 0.985;  // ~10 deg: full exclusion
+static const float SUN_EXCL_COS_OUTER = 0.906;  // ~25 deg: smooth edge
+
 groupshared float3	sharedCubeWalls[6];
 
 //при нормальном HDR корректировать тут нечего, тогда и выпилить
@@ -160,18 +171,53 @@ void BuildAmbientCube(uint id: SV_GroupIndex, uniform uint samplesPerWall, unifo
 	}
 	else
 	{
+		// [MOD] Sun-cone exclusion + trusted ground half.
+		//
+		// Side walls previously cosine-integrated the full env probe, whose
+		// below-horizon half is unreliable hazed distant terrain, and whose
+		// circumsolar region carries the smeared Mie forward peak. This:
+		//   1) rejects below-horizon samples (the unreliable ground half),
+		//   2) excludes the circumsolar cone with weight renormalization
+		//      (in-paints the cone with surrounding diffuse sky),
+		//   3) composites the trusted live terrain render (surfAmbient, the
+		//      same source the bottom wall uses, FIX #11) as the ground half.
+		//
+		// The rejected-sample fraction MEASURES the cosine-weighted ground
+		// split (~0.5 for a side wall, ~0 for the top face) — the physical
+		// split falls out of the sampling instead of being hand-tuned. This
+		// makes the side-wall luminance/sun-side corrections in
+		// SampleEnvironmentMapApprox (steps 1 & 3) redundant; they are removed.
+		//
+		// surfAmbient here is last frame's smoothed value (pass order is
+		// buildCube -> surfaceColor -> updateCube), which is fine and slightly
+		// more temporally stable.
 		float3 N = normals[id];
-		float3 result = 0;
-		const uint cosinesamples = 32;
+		float3 skyAccum = 0;
+		float  wSky = 0;
+		uint   nGround = 0;
+		const uint cosinesamples = 64;   // raised from 32: side walls reject ~half
 
 		[loop]
 		for (uint i = 0; i < cosinesamples; ++i)
 		{
 			float2 E = hammersley(i, cosinesamples);
 			float3 L = importanceSampleCosine(E, N);
-			result += envCube.SampleLevel(ClampLinearSampler, L, 4.0).rgb;
+
+			// Reject the env-probe's below-horizon half.
+			if (L.y < 0.0) { nGround++; continue; }
+
+			// Circumsolar exclusion, renormalized via wSky.
+			float sunW = 1.0 - smoothstep(SUN_EXCL_COS_OUTER, SUN_EXCL_COS_INNER,
+			                              dot(L, gSunDir.xyz));
+			skyAccum += envCube.SampleLevel(ClampLinearSampler, L, 4.0).rgb * sunW;
+			wSky += sunW;
 		}
-		clr = result / float(cosinesamples);
+
+		float3 skyMean = skyAccum / max(wSky, 1e-3);
+
+		float groundFrac = float(nGround) / float(cosinesamples);
+		groundFrac = min(groundFrac, 0.33)
+		clr = lerp(skyMean, tmpValues[0].surfAmbient.rgb, groundFrac);
 	}
 #else
 	float3 clr = SampleEnvironmentCube(id, samplesPerWall, bOutdoor);
