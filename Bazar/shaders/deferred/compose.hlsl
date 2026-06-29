@@ -407,9 +407,10 @@ ShadowBuffer SampleShadowBuffer(uint2 pixPos, float2 uv, uint sampleIdx, float3 
 
 		// [MOD] Vegetation receivers: attenuate screen-space shadow.
 		if (flags & SF_SSS_FOLIAGE) {
-			float sssStrength = smoothstep(FOLIAGE_SSS_NEAR, FOLIAGE_SSS_FAR, dist);
+			float sssDist = distance(wPos, gCameraPos);
+			float sssStrength = smoothstep(FOLIAGE_SSS_NEAR, FOLIAGE_SSS_FAR, sssDist);
 			sss = lerp(1.0, sss, sssStrength);
-}
+		}
 	}
 #endif
 
@@ -471,10 +472,29 @@ float3 ComposeSample(ComposerInput i, uint idx, uniform bool useShadows, uniform
 	float4 aorms;
 	DecodeGBuffer(i.gbuffer, uv, idx, diffuse, normal, aorms, emissive);
 
+#if GEP_SHADOW_GEOM_NORMAL
+	// Geometric facet normal from world-position screen derivatives.
+	// Computed in uniform control flow here (NOT inside SampleShadowMap,
+	// where cascade branches make ddx/ddy undefined). Length guard:
+	// on far-from-origin maps (e.g. Afghanistan) ddx/ddy of large wPos
+	// can underflow to zero -> normalize(0) = NaN -> white sparkle.
+	// Fall back to the shading normal when degenerate.
+	float3 gnC = cross(ddx(wPos), ddy(wPos));
+	float  gnL = length(gnC);
+	float3 shadowNormal = (gnL > 1e-8) ? (gnC / gnL) : normal;
+	shadowNormal *= (dot(shadowNormal, normal) < 0.0) ? -1.0 : 1.0;
+#else
+	float3 shadowNormal = normal;
+#endif
+
 	float2 texCoord = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
 	ShadowBuffer shadow = initShadowBuffer();
 	if (useShadows)
-		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, normal, bMSAA_Edge, true, SF_FADE_CASCADE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, shadowNormal, bMSAA_Edge, true, SF_FADE_CASCADE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+	// [TEST] Solid model path lacks SF_NORMAL_BIAS, so NoL is forced to 1
+	// and the texel normal offset never activates on aircraft. To test
+	// enabling it, swap the line above for the one below (adds the flag):
+	//	shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, shadowNormal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_FADE_CASCADE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 
 	float bakedAO = aorms.x;
 	float AO = bakedAO;
@@ -581,10 +601,20 @@ float3 ComposeTerrainSample(ComposerInput i, uint idx, uniform bool useShadows, 
 	// 	}
 	// }
 
+#if GEP_SHADOW_GEOM_NORMAL
+	// Geometric facet normal (see solid path for rationale + NaN guard).
+	float3 gnC = cross(ddx(wPos), ddy(wPos));
+	float  gnL = length(gnC);
+	float3 shadowNormal = (gnL > 1e-8) ? (gnC / gnL) : normal;
+	shadowNormal *= (dot(shadowNormal, normal) < 0.0) ? -1.0 : 1.0;
+#else
+	float3 shadowNormal = normal;
+#endif
+
 	float2 texCoord = float2(i.projPos.x, -i.projPos.y)*0.5 + 0.5;
 	ShadowBuffer shadow = initShadowBuffer();
 	if (useShadows)
-		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, normal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_SOFTEN_TERRAIN_SHADOW | SF_IS_TERRAIN_SURFACE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
+		shadow = SampleShadowBuffer(uv, texCoord, idx, wPos, i.depth, shadowNormal, bMSAA_Edge, true, SF_NORMAL_BIAS | SF_SOFTEN_TERRAIN_SHADOW | SF_IS_TERRAIN_SURFACE | SF_SSS | (useBlurFlatShadows ? SF_BLUR_FLAT_SHADOW : 0));
 
 	float bakedAO = aorms.x;
 	float AO = bakedAO;
