@@ -273,7 +273,7 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 	// directional albedo) rather than the empirical exp2(-16r-1) fit.
 	// Tight BRDF lobes (high Ess) track AO closely; wide lobes (low Ess)
 	// are forgiving because the lobe overlaps most of the visible hemisphere.
-	float specOcc = saturate(pow(NoV + fadedAO, Ess) - 1.0 + fadedAO);
+	float specOcc = saturate(pow(NoV + fadedAO, exp2(-16.0 * roughness - 1.0)) - 1.0 + fadedAO);
 	specOcc = max(specOcc, 0.08);
 
 	// Multi-bounce specular: gate lift by hemisphere visibility.
