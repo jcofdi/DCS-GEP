@@ -107,7 +107,7 @@ float4 getReflectionDistorsionColor(float2 uv, float3 normal, float distance) {
 // vector (always ~1.0), making 'distance' useless. Now we compute the true
 // camera-to-surface distance before normalizing. This fixes reflection distortion
 // and scatter calculations that depend on real distance.
-float3 waterCompose(uint2 uvPix, float2 uvTex, float3 pos, float3 normal, float shadow, float wLevel, float foam, float deepFactor, float riverLerp) {
+float3 waterCompose(uint2 uvPix, float2 uvTex, float3 pos, float3 normal, float shadow, float wLevel, float foam, float isWake, float deepFactor, float riverLerp) {
 
 	float3 toCamera = gCameraPos - pos;          // [MOD] renamed for clarity
 	float distance = length(toCamera);            // [MOD] true distance first
@@ -132,7 +132,7 @@ float3 waterCompose(uint2 uvPix, float2 uvTex, float3 pos, float3 normal, float 
 	float4 reflection_color = getReflectionDistorsionColor(uvTex, normal, distance);
 	float3 scatterColor = GammaToLinearSpace(lerp(g_ScatterColor, g_RiverScatterColor, riverLerp)) * g_ScatterIntensity;
 
-	float3 result = waterShading(pos, float4(viewDir, distance), normal, color, reflection_color.xyz, shadow, foam, sunLight, riverLerp);
+	float3 result = waterShading(pos, float4(viewDir, distance), normal, color, reflection_color.xyz, shadow, foam, isWake, sunLight, riverLerp);
 
 	result += CalculateDynamicLightingTiled(uvPix, deepColor + scatterColor * 0.5, float3(0.25,0.25,0.25), 0.2, normal, viewDir, pos, 0, float2(1, g_SpecularIntensity), 0, LL_SOLID, true);
 	return result;
@@ -164,4 +164,4 @@ float3 underwaterCompose(uint2 uvPix, float2 uvTex, float3 pos, float3 normal, f
 	return color;
 }
 
-#endif
+#endifa
