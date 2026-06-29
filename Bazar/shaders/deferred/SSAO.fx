@@ -22,9 +22,25 @@
 
 #define SIGMA (GAUSS_KERNEL - 1)*1.4
 
-// Thin occluder compensation (XeGTAO formulation)
-static const float THIN_OCCLUDER_BETA = 0.00; //disabled for ground-truth testing
-// static const float THIN_OCCLUDER_BETA = 0.02; 
+// Thin-occluder progressive horizon decay (Jimenez Eq.13 variant). NOTE: applied as a
+// per-step horizon-COSINE decrement (horizonCos -= BETA), NOT the XeGTAO delta.z inflation
+// factor -- despite the "BETA" name. Disabled pending a deficit guard; the fastACos domain
+// clamp in GTAO_Value makes the decay path safe (no NaN at grazing) if re-enabled.
+static const float THIN_OCCLUDER_BETA = 0.00; // disabled for ground-truth testing
+// static const float THIN_OCCLUDER_BETA = 0.02;
+
+// --- GEP authored AO neighborhood (replaces engine `radius` cbuffer scaling) ---
+// The Jimenez/XeGTAO falloff (falloffFrom/Range) is calibrated for a CONSTANT world radius.
+// The old `radius * sqrt(vPos.z)` shrank the neighborhood at close range (under-occluding
+// contact detail -- why `radius` was bumped) and grew it at distance (over-occluding). A
+// fixed world radius fixes both. `radius` (cbuffer, below) is now unused -- left declared
+// so the engine's by-name binding and $Globals layout stay undisturbed. [TUNE]
+static const float GEP_AO_RADIUS_WORLD   = 0.5;   // metres, terrain / external objects
+static const float GEP_AO_RADIUS_COCKPIT = 0.12;  // metres, fine cockpit detail
+// Sampling-kernel floor in pixels (sampling budget, not the world neighborhood). Keeps the
+// marginal band wide enough for the STEP budget to hit distinct pixels; the world falloff
+// still bounds contribution so the floor cannot over-occlude. [TUNE]
+static const float GEP_AO_PX_FLOOR       = 4.0;
 
 
 float radius;
@@ -112,28 +128,32 @@ float4 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SL
 	// View direction (from surface point toward camera)
 	float3 viewVec = normalize(-vPos);
 
-	// Compute the AO sampling radius in view space
-	// Cockpit: fixed small radius for fine detail (gauge bezels, panel edges)
-	// External: scales with sqrt(distance) for appropriate world-space coverage
-	float aoRadius;
-	if (isCockpit)
-		aoRadius = radius * 0.25;
-	else
-		aoRadius = radius * pow(vPos.z, 0.5) * (0.06666 * DIST_FACTOR);
+	// AO neighborhood: a fixed WORLD-SPACE radius (metres), authored by GEP rather than
+	// scaled from the opaque engine `radius`. This is the physical quantity the
+	// Jimenez/XeGTAO falloff below expects, and it drives falloffFrom/falloffRange.
+	float aoRadius = isCockpit ? GEP_AO_RADIUS_COCKPIT : GEP_AO_RADIUS_WORLD;
 
-	// Convert world-space radius to approximate screen-space pixel radius
-	// gProj[0][0] is the horizontal projection scale (1 / tan(fov/2))
-	float screenRadius = aoRadius * gProj[0][0] * 0.5 * viewport.z / max(vPos.z, 0.1);
+	// Project the world neighborhood to a screen-space pixel count.
+	// Vertical form (gProj[1][1] = 1/tan(vfov/2), viewport.w = height): aspect cancels, so
+	// this is correct at any resolution/aspect and identical to the old
+	// gProj[0][0]*viewport.z form. Zooming in raises gProj[1][1], growing the kernel
+	// automatically -- this keeps occluders in-range under spotting-zoom on distant
+	// geometry, which is what the old dynamic pixel cap hand-tuned.
+	float screenRadius = aoRadius * gProj[1][1] * 0.5 * viewport.w / max(vPos.z, 0.1);
 
-	// Early out if the AO radius is smaller than ~1 pixel
+	// Early out when the projected neighborhood is sub-pixel: world-per-pixel then exceeds
+	// the neighborhood, no sample lands inside the falloff, so AO is negligible. Both the
+	// physical and the perf cutoff; the zoom term above lifts a pixel back over it.
 	if (screenRadius < 1.5)
 		return float4(1.0, vPos.z, 0, 0);
 
-
-	// V4: Resolution-independent, distance-adaptive screen radius cap.
-	float resScale = viewport.z / 2560.0;
-	float maxScreenRadius = lerp(128.0, 384.0, exp(-vPos.z * 0.03)) * resScale;
-	screenRadius = min(screenRadius, maxScreenRadius);
+	// Clamp the SAMPLING KERNEL (pixels) -- NOT the world neighborhood.
+	//   Ceil:  bounds cost / screen-space halos. Height-normalized (viewport.w / 1440) so
+	//          it is correct for ultrawide / non-2560 widths (old viewport.z/2560 was
+	//          width-based and ~1.34x too loose at 3440x1440).
+	//   Floor: keeps the marginal [1.5 .. floor] band usable for the STEP budget.
+	float maxScreenRadius = lerp(128.0, 384.0, exp(-vPos.z * 0.03)) * (viewport.w / 1440.0);
+	screenRadius = clamp(screenRadius, GEP_AO_PX_FLOOR, maxScreenRadius);
 
 	// Pixel-too-close threshold: don't sample the center pixel itself
 	float minStep = 1.3 / screenRadius;
@@ -249,8 +269,12 @@ float4 GTAO_Value(uint2 pix, float3 vPos, uniform bool isCockpit, uniform int SL
 		// Convert horizon cosines to angles
 		// h0 is the horizon angle in the negative direction (negated because it's the "left" side)
 		// h1 is the horizon angle in the positive direction
-		float h0 = -fastACos(horizonCos1);
-		float h1 =  fastACos(horizonCos0);
+		// Clamp to fastACos domain [-1,1]: the thin-occluder decay (horizonCos -= BETA) is
+		// unbounded below and can leave the valid cosine range, yielding NaN (sqrt of a
+		// negative) at grazing angles. The hemisphere clamp below handles the rest -- a
+		// decay past baseline is harmless once the value is back in domain.
+		float h0 = -fastACos(clamp(horizonCos1, -1.0, 1.0));
+		float h1 =  fastACos(clamp(horizonCos0, -1.0, 1.0));
 
 		// Clamp to the hemisphere defined by the surface normal projected into this slice
 		h0 = n + clamp(h0 - n, -GTAO_PI_HALF, GTAO_PI_HALF);
