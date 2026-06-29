@@ -221,6 +221,7 @@ GBufferWater buildGBuffer(float3 wpos, float4 NDCpos, uniform bool useFoamFFT, u
 	float3 normal = restoreNormal(result.xy);
 
 	float foam = 0;
+	float foamWake = 0;
 	// [MOD] Increased foam multiplier from 1.5 to 2.5.
 	if (useFoamFFT) {
 #if 1
@@ -267,7 +268,7 @@ GBufferWater buildGBuffer(float3 wpos, float4 NDCpos, uniform bool useFoamFFT, u
 
 	normal = mul(normal, (float3x3)gLocalInv); // TODO: GEOTERRAIN spherify normals
 
-	return BuildGBufferWater(normal, wLevel, foam, deepFactor, NDCpos, 0, alpha);
+	return BuildGBufferWater(normal, wLevel, foam, foamWake, deepFactor, NDCpos, 0, alpha);
 }
 
 #endif
