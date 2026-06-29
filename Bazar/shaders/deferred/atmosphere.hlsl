@@ -191,54 +191,14 @@ float3 SampleEnvironmentMapApprox(EnvironmentIrradianceSample eis, float3 normal
 	float3 pz     = AmbientMap[4].rgb; // +Z
 	float3 mz     = AmbientMap[5].rgb; // -Z
 
-	// === 1) SUN-SIDE ATTENUATION ===
-	// Diffuse ambient primarily fills shadowed surfaces. Shadowed surfaces
-	// cannot see the sun-side sky, so the sun-brightened wall over-represents
-	// light that most ambient-dependent surfaces never receive. Pull each
-	// wall toward the average of the other three proportional to how much
-	// it faces the sun.
-	//
-	// Below horizon (gSunDir.y <= 0): no correction. Twilight/golden hour
-	// directionality is preserved — the subtle warm/cool gradients at low
-	// sun angles are the most visually important ambient color variation
-	// and occur when sun contribution to wall brightness is minimal.
-	//
-	// Sun elevation ramp: 0° → 0 (off), ~15° → 0.5, ~25°+ → 1.0 (full).
-	// Gradual onset avoids harsh transition at sunrise.
-	float sunElevation = saturate(gSunDir.y * 2.5);
+	// [MOD] Sun-side attenuation (former step 1) and side-wall luminance
+	// override (former step 3) removed. Both compensated for defects now
+	// fixed at the source in BuildAmbientCube (ambientCompute.fx): the Mie
+	// forward-peak contamination is excluded via circumsolar cone, and the
+	// untrustworthy ground half is replaced by the live surfAmbient render.
+	// The walls arriving here already carry correct directional energy.
 
-	if (sunElevation > 0.01)
-	{
-		// Project sun direction onto horizontal plane
-		float3 sunHoriz = normalize(float3(gSunDir.x, 0.001, gSunDir.z));
-
-		// How much each wall faces the sun [0..1]
-		// +X normal = (1,0,0), -X = (-1,0,0), +Z = (0,0,1), -Z = (0,0,-1)
-		float4 sunFacing = saturate(float4(
-			sunHoriz.x,     // +X faces sun when sun is in +X direction
-			-sunHoriz.x,    // -X faces sun when sun is in -X direction
-			sunHoriz.z,     // +Z
-			-sunHoriz.z     // -Z
-		));
-
-		// For each wall, compute average of the other three as fallback.
-		// This represents what a shadowed surface actually sees from that
-		// general direction — the non-sun-brightened sky.
-		float3 wallSum = px + mx + pz + mz;
-		float3 avgNotPx = (wallSum - px) * (1.0 / 3.0);
-		float3 avgNotMx = (wallSum - mx) * (1.0 / 3.0);
-		float3 avgNotPz = (wallSum - pz) * (1.0 / 3.0);
-		float3 avgNotMz = (wallSum - mz) * (1.0 / 3.0);
-
-		// Attenuate: sun-facing walls blend toward their non-sun average.
-		// Walls perpendicular or opposite to sun are unaffected (sunFacing ≈ 0).
-		px = lerp(px, avgNotPx, sunFacing.x * sunElevation);
-		mx = lerp(mx, avgNotMx, sunFacing.y * sunElevation);
-		pz = lerp(pz, avgNotPz, sunFacing.z * sunElevation);
-		mz = lerp(mz, avgNotMz, sunFacing.w * sunElevation);
-	}
-
-	// === 2) HAZE VARIANCE CHECK (on sun-corrected walls, before luminance) ===
+	// === HAZE VARIANCE CHECK (before chrominance correction) ===
 	float4 wallLums = float4(dot(px, lumW), dot(mx, lumW),
 	                         dot(pz, lumW), dot(mz, lumW));
 	float wallMean = dot(wallLums, 0.25);
@@ -250,24 +210,7 @@ float3 SampleEnvironmentMapApprox(EnvironmentIrradianceSample eis, float3 normal
 	float topLum = max(0.001, dot(top, lumW));
 	float3 topChroma = top / topLum;
 
-	// === 3) SIDE WALL LUMINANCE CORRECTION ===
-	float cubeTopLum = max(0.001, dot(top, lumW));
-	float cubeBotLum = max(0.001, dot(bottom, lumW));
-
-	float skyWeight = 0.80;
-	float expectedSideLum = cubeTopLum * skyWeight + cubeBotLum * (1.0 - skyWeight);
-
-	float pxLum = max(0.001, wallLums.x);
-	float mxLum = max(0.001, wallLums.y);
-	float pzLum = max(0.001, wallLums.z);
-	float mzLum = max(0.001, wallLums.w);
-
-	px *= expectedSideLum / pxLum;
-	mx *= expectedSideLum / mxLum;
-	pz *= expectedSideLum / pzLum;
-	mz *= expectedSideLum / mzLum;
-
-	// === 4) SIDE WALL CHROMINANCE HAZE CORRECTION ===
+	// === SIDE WALL CHROMINANCE HAZE CORRECTION ===
 	float corrPxLum = max(0.001, dot(px, lumW));
 	float corrMxLum = max(0.001, dot(mx, lumW));
 	float corrPzLum = max(0.001, dot(pz, lumW));
@@ -296,8 +239,13 @@ float3 SampleEnvironmentMapApprox(EnvironmentIrradianceSample eis, float3 normal
 		float targetTopLum = sideAvgLum * 2.0 * effectiveRatio;
 		float targetBotLum = sideAvgLum * 2.0 * (1.0 - effectiveRatio);
 
-		top *= lerp(1.0, targetTopLum / cubeTopLum, cloudInfluence);
-		bottom *= lerp(1.0, targetBotLum / cubeBotLum, cloudInfluence);
+		// [MOD] Denominators were the step-3 locals cubeTopLum/cubeBotLum.
+		// Step 3 removed; topLum (computed above) equals the former cubeTopLum,
+		// and the bottom luminance is re-derived locally here. Both read the
+		// current (unmodified) top/bottom faces, as before.
+		float botLum = max(0.001, dot(bottom, lumW));
+		top    *= lerp(1.0, targetTopLum / topLum, cloudInfluence);
+		bottom *= lerp(1.0, targetBotLum / botLum, cloudInfluence);
 	}
 
 	// === NSQUARED EVALUATION ON CORRECTED FACES ===
