@@ -133,9 +133,14 @@ static const float BILATERAL_SENSITIVITY = 5e7;
 
 float4 filterMip(float2 uv, float radius, uniform uint count) {
 
-	// Vogel disk: uniform area coverage replaces stock quadratic spiral
-	// which concentrated ~75% of taps in the inner 25% of disc area.
-	static const float GOLDEN_ANGLE = 2.39996323;
+	// [FIX] Quadratic spiral RESTORED (reverts the Vogel uniform-disk change).
+	// The center concentration is the filter's design, not a sampling flaw:
+	// offset^2 weighting makes this an implicitly center-weighted reconstruction
+	// kernel (most energy near the pixel, sparse far taps for denoise reach).
+	// Uniform Vogel coverage at the same radius is a flat disc blur -- it
+	// averaged sharp SSLR content evenly with its whole neighborhood,
+	// destroying reflection detail (v01a-vs-current bisect, July 2026).
+	static const float incr = 3.1415926535897932384626433832795 * (3.0 - sqrt(5.0));
 
 	// Depth-aware bilateral filtering (Wronski / Guerrilla GDC 2014):
 	// Read center pixel depth to reject spiral samples that cross depth
@@ -157,16 +162,28 @@ float4 filterMip(float2 uv, float radius, uniform uint count) {
 	float offs = 1.0 / count;
 	float angle = 0, offset = 0;
 
+	// [MOD] Luma-bilateral reference: reflected-content edges (bright panel
+	// against sky) sit at uniform receiver depth, so the depth bilateral
+	// cannot protect them and the kernel bleeds them into halos. Comparing
+	// Reinhard-compressed luminance (robust across HDR range) rejects taps
+	// that differ strongly from the center's content. Applied only to taps
+	// with valid content (a > 0) so the stock alpha edge-fade from empty
+	// taps is preserved. Tuning bracket: LUMA_SENSITIVITY 4.0-16.0.
+	float3 centerCol = sourceTex.SampleLevel(ClampLinearSampler, uv, 0).rgb;
+	float centerLum = dot(centerCol, float3(0.2126, 0.7152, 0.0722));
+	centerLum = centerLum / (1.0 + centerLum);
+	static const float LUMA_SENSITIVITY = 8.0;
+
 	float4 acc = 0;
 	float wSum = 0;
 
 	[unroll(count)]
 	for (uint i = 0; i < count; ++i) {
-		float vogelR = sqrt((float(i) + 0.5) / float(count));
-		float theta  = float(i) * GOLDEN_ANGLE;
+		offset += offs;
+		angle += incr;
 		float s, c;
-		sincos(theta, s, c);
-		float2 delta = float2(c, s) * (vogelR * radius);
+		sincos(angle, s, c);
+		float2 delta = float2(c, s) * (offset * offset * radius);
 		float4 col = sourceTex.SampleLevel(ClampLinearSampler, uv + delta, 0);
 
 		// Bilateral weight: Gaussian falloff on raw depth difference.
@@ -181,6 +198,15 @@ float4 filterMip(float2 uv, float radius, uniform uint count) {
 #else
 		float bilateralW = 1.0;
 #endif
+
+		// [MOD] Luma term (see above). Empty taps keep weight 1 so alpha
+		// edge-fade behavior matches stock.
+		if (col.a > 0.001) {
+			float tapLum = dot(col.rgb, float3(0.2126, 0.7152, 0.0722));
+			tapLum = tapLum / (1.0 + tapLum);
+			float dl = tapLum - centerLum;
+			bilateralW *= exp(-dl * dl * LUMA_SENSITIVITY);
+		}
 
 		acc += float4(col.rgb * col.a, col.a) * bilateralW;
 		wSum += bilateralW;
