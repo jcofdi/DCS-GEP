@@ -169,24 +169,36 @@
 #define PCSS_DYNAMIC_TAPS 1     // 0 = static full budget (A/B baseline)
 #define PCSS_MIN_PCF_TAPS 8
 
-// Per-cascade PCF floor (in texels).  Minimum filter radius when PCSS
-// produces a physical penumbra smaller than this value.  Directly
-// controls contact shadow sharpness and staircase dissolution.
+// Disk area (texels^2) each PCF tap is assumed to cover in the dynamic
+// tap count.  4.0 = one hardware bilinear footprint (2x2): zero-noise
+// tiling, i.e. current shipping behavior.  Raising it (6.0-8.0) thins
+// mid-radius disk fill for proportional savings, paid as blue-noise
+// grain inside soft gradients only.  This is the honest quality/perf
+// dial for lower settings tiers.
+#define PCSS_TAP_AREA 4.0
+
+// ── Per-cascade PCF floor radius (texels) ───────────────────────────
+// Minimum filter radius when PCSS produces a physical penumbra smaller
+// than this value (contact).  Directly controls contact sharpness and
+// staircase dissolution.
 //
 // Guide (approximate):
 //   0.5  = hardware bilinear only, maximum possible sharpness
 //   1.0  = minimal PCF, staircase barely dissolved
-//   1.5  = good staircase coverage, still sharp contacts
-//   2.0  = noticeable edge softness, complete staircase dissolution
-//   3.0  = stock-equivalent softness, cleanest appearance
+//   1.5  = sharp contacts, but exposes raw map aliasing at high
+//          magnification (cockpit sawtooth + swim from sub-texel
+//          caster motion)
+//   3.0  = stock DCS's fixed kernel -- the field-validated number
+//          that keeps the map staircase sub-perceptual everywhere
 //
-// Inner cascades have denser texels, so the same floor value produces
-// sharper world-space contacts.  Outer cascades may benefit from a
-// larger floor to dissolve their coarser texel grid.
-#define PCSS_FLOOR_CASCADE_3 1.5
-#define PCSS_FLOOR_CASCADE_2 1.75
-#define PCSS_FLOOR_CASCADE_1 2.0
-#define PCSS_FLOOR_CASCADE_0 2.5
+// NOTE: the 8-tap PCSS_MIN_PCF_TAPS minimum cleanly fills up to a
+// 3.19-texel disk, so a 3.0 floor costs ZERO extra taps vs 1.5.
+// Revisit downward only when screen-space contact shadows land to
+// carry the sub-3-texel contact definition instead of the map.
+#define PCSS_FLOOR_CASCADE_3 3.0
+#define PCSS_FLOOR_CASCADE_2 3.0
+#define PCSS_FLOOR_CASCADE_1 3.0
+#define PCSS_FLOOR_CASCADE_0 3.0
 
 // PCSS radius overdrive multiplier.  Controls how far beyond the clean
 // fill threshold PCSS is allowed to extend, trading visible grain for
@@ -241,6 +253,14 @@
 // the PCF comparison taps).  8-16 provides good coverage.
 //
 #define PCSS_BLOCKER_SEARCH_TAPS 16
+
+// Umbra early-out threshold: fraction of total search weight that must
+// classify as blocker (with the center tap fully dark) to declare the
+// pixel umbra interior and skip the PCF disk entirely.  Conservative
+// on purpose -- lowering it risks clipping the deep tail of very wide
+// penumbrae to hard black.  Tune only against a long low-sun shadow's
+// soft far edge.
+#define PCSS_UMBRA_COVERAGE 0.999
 
 // ── Grazing curvature clamp ─────────────────────────────────────────
 // Curved receivers (fuselages) always present a grazing band to the
@@ -338,6 +358,9 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 
 		// Start with per-cascade floor; PCSS will widen if blockers found.
 		float pcssR = floorRadius;
+		// Set by the search-verdict early-outs below; when true the PCF
+		// disk is skipped entirely and acc carries the final answer.
+		bool skipPCF = false;
 
 #if PCSS_ENABLE
 		// ── Cloud-modulated effective angular diameter ───────────
@@ -398,15 +421,23 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 		// not the full penumbra width.
 		float searchWorld = receiverCascadeDepth * effectiveAngularDiameter * 0.5;
 		float searchTexels = searchWorld * texelsPerMeter;
-		searchTexels = min(searchTexels, 64.0);
+		// Floor clamp: the search must never cover less area than the
+		// PCF disk it vouches for, or the early-outs below could skip
+		// an edge the floor-radius PCF would have caught (staircase
+		// pinholes at contacts).  Also fixes sub-texel search reach on
+		// inner cascades at shallow receiver depths.
+		searchTexels = clamp(searchTexels, floorRadius, 64.0);
 		float searchRadius = searchTexels / ShadowMapSize;
 
-		// Vogel-disk blocker search with configurable mip level.
-		// Non-comparison reads (SampleLevel) are cheaper than PCF taps.
-		// At higher mip levels, each tap effectively covers a block of
-		// texels, dramatically improving blocker detection coverage.
+		// Vogel-disk blocker search via GatherRed: each fetch returns
+		// the 2x2 texel quad around the tap, so 16 taps classify 64
+		// depths -- matching the NVIDIA reference lineage's 64-search /
+		// 128-filter top preset.  Non-comparison gathers are cheap, and
+		// the 4x estimate density is what stabilizes avgBlockerDepth
+		// (and therefore pcssR) against patch-to-patch flicker.
 		float blockerSum = 0;
 		float blockerCount = 0;
+		float searchWeightTotal = 0;
 
 		// Reuse the blue noise base angle (computed later for PCF, but
 		// we need it here too).  Project wPos to screen for the lookup.
@@ -426,30 +457,42 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 			// Uniform area distribution (sqrt) for blocker search --
 			// we want even coverage, not rim bias.
 			float2 searchDelta = float2(sc, ss) * (sqrt(st) * searchRadius);
+			float2 tapUV = shadowCoord.xy + searchDelta;
 
-			float sd = cascadeShadowMap.SampleLevel(
+			// Gather snaps to the bilinear quad's texel boundaries, so
+			// recover each texel's TRUE offset from the receiver for
+			// exact plane-relative classification -- using the nominal
+			// tap offset would bias the plane test by up to ~0.7 texel.
+			// Component order: w=TL, z=TR, x=BL, y=BR.
+			float4 quad = cascadeShadowMap.GatherRed(
 				gPointClampSampler,
-				float3(shadowCoord.xy + searchDelta, 3 - idx),
-				0).x;
+				float3(tapUV, 3 - idx));
 
-			// Plane-relative blocker test: compare against the
-			// receiver surface depth at the tap position, not the
-			// center depth.  Prevents the receiver's own slope from
-			// registering as a blocker (the self-detection feedback
-			// loop that manufactured wide PCSS disks on unshadowed
-			// slopes).
-			float planeZ = shadowCoord.z + dot(searchDelta, dzdUV);
-			if (sd > planeZ + bias * 2.0)
-			{
-				// Center-weighted: blockers closer to the pixel center
-				// are more relevant to this pixel's penumbra than those
-				// at the search periphery.  Reduces noise at shadow
-				// boundaries where the search partially overlaps the
-				// geometric shadow.
-				float weight = 1.0 - st;
-				blockerSum += sd * weight;
-				blockerCount += weight;
-			}
+			float texelUV = 1.0 / ShadowMapSize;
+			float2 tlTexel = (floor(tapUV * ShadowMapSize - 0.5) + 0.5) * texelUV;
+			float2 dTL = tlTexel - shadowCoord.xy;
+
+			float4 sd = float4(quad.w, quad.z, quad.x, quad.y); // TL TR BL BR
+			float4 planeZ4 = shadowCoord.z + float4(
+				dot(dTL,                              dzdUV),
+				dot(dTL + float2(texelUV, 0.0),       dzdUV),
+				dot(dTL + float2(0.0,     texelUV),   dzdUV),
+				dot(dTL + float2(texelUV, texelUV),   dzdUV));
+
+			// Plane-relative blocker test per texel: prevents the
+			// receiver's own slope from registering as a blocker (the
+			// self-detection feedback loop that manufactured wide PCSS
+			// disks on unshadowed slopes).
+			float4 hit = step(planeZ4 + bias * 2.0, sd);
+
+			// Center-weighted (1 - st), shared across the quad -- the
+			// quad spans one texel, negligible against the search
+			// radius.  Blockers nearer the pixel center matter more to
+			// this pixel's penumbra than those at the periphery.
+			float weight = 1.0 - st;
+			blockerSum        += weight * dot(hit, sd);
+			blockerCount      += weight * dot(hit, float4(1, 1, 1, 1));
+			searchWeightTotal += weight * 4.0;
 		}
 
 		if (blockerCount > 0)
@@ -488,6 +531,29 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 #endif
 			}
 		}
+
+		// ── Early-outs from the search verdict ──────────────────────
+		// The 64-depth survey (reach >= the PCF floor) is dense enough
+		// to vouch for the trivial cases; the NVIDIA reference ships
+		// the lit-side form verbatim (numBlockers == 0 -> return).
+		//  - Lit: no blockers anywhere AND the center tap agrees fully
+		//    lit -> nothing for the PCF disk to find; acc (hardware
+		//    bilinear center tap) already carries any sub-texel edge.
+		//  - Umbra: search saturated with blockers AND center fully
+		//    dark -> umbra interior; skips the widest, most expensive
+		//    disks in the frame (wide-shadow interiors).
+		// Penumbra/boundary pixels never satisfy either -- search and
+		// center disagree there -- so they always take the full path.
+		if (blockerCount <= 0.0 && acc > 0.999)
+		{
+			skipPCF = true;
+		}
+		else if (blockerCount >= searchWeightTotal * PCSS_UMBRA_COVERAGE
+			&& acc < 0.001)
+		{
+			acc = 0.0;
+			skipPCF = true;
+		}
 #endif // PCSS_ENABLE
 
 		// ── Grazing curvature clamp ─────────────────────────────────
@@ -505,15 +571,16 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 		pcssR = max(min(pcssR, grazeMax), floorRadius);
 #endif // GEP_USE_GRAZING_CLAMP
 
+		if (!skipPCF) {
 		const float radius = pcssR / ShadowMapSize;
 
 		// ── Dynamic tap count ───────────────────────────────────────
-		// Taps needed to cleanly fill the realized radius (texels):
-		// inverse of maxCleanRadius = sqrt(count*4/pi). Clamped to the
-		// dither floor and the per-cascade budget ceiling. When the knob
-		// is off, dynCount == count (original static behavior).
+		// Taps needed to fill the realized radius (texels) at the
+		// configured area-per-tap (4.0 = clean bilinear tiling; see
+		// PCSS_TAP_AREA).  Clamped to the dither floor and the
+		// per-cascade budget ceiling.
 #if PCSS_DYNAMIC_TAPS
-		uint dynCount = (uint)ceil(pcssR * pcssR * PI_VAL * 0.25);
+		uint dynCount = (uint)ceil(pcssR * pcssR * PI_VAL / PCSS_TAP_AREA);
 		dynCount = clamp(dynCount, (uint)PCSS_MIN_PCF_TAPS, count);
 #else
 		uint dynCount = count;
@@ -571,6 +638,7 @@ float SampleShadowMap(float3 wPos, float3 normal, float NoL, uniform uint idx, u
 				tapDepth);
 		}
 		acc /= dynCount;
+		} // !skipPCF
 	}
 	// Gentle terminator ramp: at extreme grazing, residual peter-pan
 	// detachment from the shipping bias is visible.  The ramp darkens
