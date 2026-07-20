@@ -148,6 +148,15 @@
 	#define GET_SSR  FUNC_NAME(getSSR, SSR_GetColor)
 #endif
 
+// [MOD] Hit-confidence tolerance (view-space meters). Residual within
+// tolerance = full confidence; beyond = linear fade to 0. BASE covers
+// near-field surface thickness; SCALE tracks depth-buffer precision loss
+// with distance. Tuning brackets: BASE 0.5-2.0, SCALE 0.001-0.004.
+#ifndef SSR_CONF_TOL_BASE
+#define SSR_CONF_TOL_BASE  0.75
+#define SSR_CONF_TOL_SCALE 0.002
+#endif
+
 float4 RAYMARCH(float3 pos, float3 dir, float offset)
 { // in view space, dir must be normalized
 
@@ -185,10 +194,19 @@ float4 RAYMARCH(float3 pos, float3 dir, float offset)
 
 		float3 rayEnd = pos + dir * t;
 		float2 screenCoord = getScreenCoord(rayEnd);
+		// Early-out: ray exited the viewport. DepthSampler BORDER mode
+		// returns 0 for OOB reads, which getDepth() reconstructs as a
+		// near-plane Z value — causing false hits at screen borders.
+		if (any(screenCoord < 0) || any(screenCoord > 1))
+			return 0;
 		float depth = getDepth(screenCoord);
 		float delta = rayEnd.z - depth - 0.5;
 		float delta2 = depth - pos.z + offset;
 		if (delta > 0 && delta2 > lerp(delta, 0, saturate(rayEnd.z*0.0002)) ) {
+			// Reject hits at extreme depth (sky, clouds, far plane) —
+			// no physical validity for SSR; belongs to the environment map.
+			if (depth > 50000.0)
+				continue;
 			float lo = prevRayLen;
 			float hi = rayLen;
 
@@ -212,7 +230,20 @@ float4 RAYMARCH(float3 pos, float3 dir, float offset)
 			float finalT = -cross(finalSp, pos).z / cross(finalSp, dir).z;
 			float3 finalEnd = pos + dir * finalT;
 			float2 finalUV = getScreenCoord(finalEnd);
-			return SSR_GetColor(finalUV);
+
+			// [MOD] Hit-confidence alpha. A genuine flat-surface hit converges
+			// under bisection (residual -> ~0). A silhouette straddle cannot
+			// converge (the bracket contains a depth discontinuity), leaving a
+			// large residual. Encoding that as alpha turns the stochastic
+			// hit/miss dither at reflection boundaries into a smooth analytic
+			// fade the compositor and filter can average. Alpha = estimator
+			// confidence, not binary hit.
+			float finalResidual = abs(finalEnd.z - getDepth(finalUV) - 0.5);
+			float confTol = SSR_CONF_TOL_BASE + finalEnd.z * SSR_CONF_TOL_SCALE;
+			float conf = saturate(1.0 - finalResidual / confTol);
+			float4 hitColor = SSR_GetColor(finalUV);
+			hitColor.a *= conf;
+			return hitColor;
 		}
 
 		prevRayLen = rayLen;
