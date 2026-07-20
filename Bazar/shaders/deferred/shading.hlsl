@@ -112,6 +112,22 @@ float3 EvaluateSunBRDF(float3 diffuseColor, float3 specularColor,
 		* (D_ggx(roughness, NoH_spec) * Visibility_smithGGX(roughness, NoV, NoL_spec));
 	sunSpecular *= energyComp;
 
+	// Representative-point energy normalization (Karis 2013, "Real Shading in
+	// Unreal Engine 4", §Area Lights). Moving L to the closest point on the
+	// solar disc widens the effective NDF lobe without conserving energy: the
+	// highlight becomes a top-hat at undiminished peak height, ADDING energy
+	// as the disc grows (worst under cloud-broadened sunAngle, where every
+	// low-roughness texel within the disc fires peak D — the distant-terrain
+	// white-fringe artifact). Scale by (a/a')^2 with a' = saturate(a + r/(2d));
+	// for a directional disc, r/d = tan(sunAngle) ~= sunSinAngle.
+	// Limits: a >> disc -> discNorm ~= 1 (punctual behavior, rough surfaces
+	// untouched); a << disc -> plateau attenuated to the conserved-energy
+	// disc image (physically, a mirror shows the sun as a uniform disc).
+	float alphaSun   = roughness * roughness;
+	float alphaPrime = saturate(alphaSun + 0.5 * sunSinAngle);
+	float discNorm   = alphaSun / alphaPrime;
+	sunSpecular *= discNorm * discNorm;
+
 	// Direct sun diffuse Fresnel coupling: (1-F) partitions energy
 	// between specular and diffuse for punctual lights. For IBL, the
 	// hemispherically integrated E_ms is correct instead.
