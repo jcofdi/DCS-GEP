@@ -403,7 +403,7 @@ float4 PS_BLUR(const VS_OUTPUT i, uniform int GAUSS_KERNEL): SV_TARGET0 {
 technique10 SSAO {
 	//                          Slices, Steps, DistFactor
 	pass SSAO_1	{
-		SetPixelShader(CompileShader(ps_5_0, PS(16, 32, 3.0)));
+		SetPixelShader(CompileShader(ps_5_0, PS(4, 8, 3.0)));
 		COMMON_PART
 	}
 	pass SSAO_2 {
