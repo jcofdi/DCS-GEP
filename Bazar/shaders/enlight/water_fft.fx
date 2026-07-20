@@ -5,7 +5,7 @@ RWTexture2DArray<float4> u_Normal;
 Texture2DArray<float> u_WindMap;
 
 Texture2DArray<float4> u_NormalRead;
-#define u_WindMapWrite u_Phase		// reuse uPhase 
+#define u_WindMapWrite u_Phase		// reuse uPhase
 
 float u_windmapLerp;
 
@@ -31,7 +31,7 @@ float tanh(float x) {
 	return (1.0 - exp(-2.0 * x)) / (1.0 + exp(-2.0 * x));
 }
 
-float rand(float2 co) {  
+float rand(float2 co) {
 	return frac(sin(dot(co.xy, float2(12.9898,78.233))) * 43758.5453);
 }
 
@@ -94,14 +94,13 @@ float spectrumInit(float2 coordinates) {
 	float cosHalf = sqrt(max(0.0, (1.0 + cosPhi) * 0.5));
 	float spreadPow = pow(max(cosHalf, 1e-6), 2.0 * sHassel);
 
-	// Normalization: ∫ cos^(2s)(θ/2) dθ over [0,2π]
-	// = Beta(s + 0.5, 0.5) = Γ(s+0.5)Γ(0.5) / Γ(s+1)
-	// Polynomial fit from gasgiant (max error < 0.3% for s ∈ [0, 100]):
+	// Normalization:
 	float s2 = sHassel * sHassel;
 	float s3 = s2 * sHassel;
 	float s4 = s3 * sHassel;
-	float Ns = 2.61 + 1.687 * sHassel + 0.316 * s2 - 0.0202 * s3 + 0.000567 * s4;
-	float spread = spreadPow / max(Ns, 1e-6);
+	float invNs = 0.1598617 + 0.2104091 * sHassel - 0.0703656 * s2
+	            + 0.0213991 * s3 - 0.0028693 * s4;
+	float spread = spreadPow * invNs;
 
 	float S = spread * pow(k, -4.0) * (Bl + Bh);
 
@@ -143,7 +142,7 @@ void CS_SPECTRUM(uint2 coordinates : SV_DispatchThreadId) {
 		float2 hZ = -multiplyByI(h * waveVector.y * rwv) * u_choppiness;
 
 		hX = hX + multiplyByI(h);
-	
+
 		u_FFT[uint3(coordinates.xy, 0)] = hX;
 		u_FFT[uint3(coordinates.xy, 1)] = hZ;
 	}
@@ -168,24 +167,27 @@ void CS_NORMAL(int2 coordinates : SV_DispatchThreadId) {
 	float3 normal = normalize(cross(dy, dx));
 
 	int tx = 30; // gDev0.x;
-	float fx1 = get_displace(int2(coordinates) + int2( tx, 0)).z - center.z;
-	float fx2 = get_displace(int2(coordinates) + int2(-tx, 0)).z - center.z;
-	float fy1 = get_displace(int2(coordinates) + int2( 0, tx)).z - center.z;
-	float fy2 = get_displace(int2(coordinates) + int2(0, -tx)).z - center.z;
+	float ny_xp = get_displace(int2(coordinates) + int2( tx, 0)).y;
+	float ny_xm = get_displace(int2(coordinates) + int2(-tx, 0)).y;
+	float ny_yp = get_displace(int2(coordinates) + int2( 0, tx)).y;
+	float ny_ym = get_displace(int2(coordinates) + int2( 0,-tx)).y;
+	float invSpan = 0.5 / (float(tx) * texelSize);
+	float2 grad_eta = float2((ny_xp - ny_xm) * invSpan, (ny_yp - ny_ym) * invSpan);
 
-	// [MOD] Increased foam sensitivity from 0.05 to 0.12.
-	// The foam value is saturated to [0,1] before output, so increasing the
-	// scale cannot produce values above 1.0; it simply makes the transition
-	// from "no foam" to "full foam" happen at lower convergence thresholds.
-	float foam = max(-fx1 - fx2 - fy1 - fy2, 0) * max(center.y, 0) * (u_resolution / 256.0 * 0.12);
+	float2 windDir = normalize(u_wind + float2(1e-6, 0));
+	float slopeAlongWind = dot(grad_eta, windDir);
+	// VV modified
+	float U10 = length(u_wind);
+	float foamCoef = lerp(5.0, 8.0, smoothstep(2.0, 18.0, U10));
+	float foam = max(-slopeAlongWind, 0) * max(center.y, 0) * (u_resolution / 256.0 * foamCoef);
 
 	float c0 = u_WindMap[uint3(coordinates, 0)];
 	float c1 = u_WindMap[uint3(coordinates, 1)];
 	float mul = 1.5 - abs(u_windmapLerp - 0.5);
 	float windMap = lerp(c0, c1, u_windmapLerp) * mul;
 
-	u_Normal[uint3(coordinates, 0)] = float4(normal.xz, center.y * 0.25, saturate(foam)); // normal + foam
-	u_Normal[uint3(coordinates, 1)] = float4(center, windMap); // displace + wind map
+	u_Normal[uint3(coordinates, 0)] = float4(normal.xz, center.y * 0.25, saturate(foam));
+	u_Normal[uint3(coordinates, 1)] = float4(center, windMap);
 }
 
 [numthreads(32, 32, 1)]
@@ -197,7 +199,7 @@ void CS_WIND_MAP_SHOT(uint2 coordinates : SV_DispatchThreadId) {
 							SetHullShader(NULL);		\
 							SetDomainShader(NULL);		\
 							SetGeometryShader(NULL);	\
-							SetPixelShader(NULL);							
+							SetPixelShader(NULL);
 
 technique10 Tech {
 	pass P0	{
@@ -225,4 +227,3 @@ technique10 Tech {
 		COMMON_CS_PART
 	}
 }
-
