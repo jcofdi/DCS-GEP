@@ -3,7 +3,7 @@
 #include "common/context.hlsl"
 #include "enlight/atmDefinitions.hlsl"
 #include "enlight/atmFunctionsCommon.hlsl"
-#include "indirectLighting/importanceSampling.hlsl" // [MOD] FIX #13 — cosine-sampled ambient cube
+#include "indirectLighting/importanceSampling.hlsl" // [MOD] FIX #13 - cosine-sampled ambient cube
 
 #ifdef USE_DCS_DEFERRED
 static const float3 minAmbient = float3(9, 26, 52) / 255.f * 0.25;
@@ -71,12 +71,16 @@ static const float3 lumCoef =  {0.2125f, 0.7154f, 0.0721f};
 // The env-cube pass renders GetSkyRadiance, whose Cornette-Shanks Mie forward
 // lobe (g~0.8) is intense in the circumsolar cone. Sampled at mip 4 it smears
 // across ~+/-15-20 deg, so a sun-facing wall reads far brighter than the
-// diffuse sky it should represent — handing shadowed sun-facing surfaces
+// diffuse sky it should represent - handing shadowed sun-facing surfaces
 // "sunlit" ambient. The disc + aureole are accounted by the analytic direct
 // term; counting them here double-counts direct light into ambient. Cone is
 // sized for the mip-4 smear, not the physical aureole (~5 deg).
 static const float SUN_EXCL_COS_INNER = 0.985;  // ~10 deg: full exclusion
 static const float SUN_EXCL_COS_OUTER = 0.906;  // ~25 deg: smooth edge
+
+// [DIAG] 1 = paint side/top ambient walls magenta to prove the FIX #13 body
+// is live in the shipping permutation. Ship at 0.
+#define GEP_CANARY_AMBIENT 0
 
 groupshared float3	sharedCubeWalls[6];
 
@@ -151,10 +155,23 @@ float3 SampleWhitePoint(float3 averageCube, bool bOutdoor)
 [numthreads(6,1,1)]
 void BuildAmbientCube(uint id: SV_GroupIndex, uniform uint samplesPerWall, uniform bool bOutdoor)
 {
-#ifdef EDGE
-	// [MOD] FIX #13 — Cosine importance-sampled ambient cube faces.
+	// [MOD] FIX #14 - EDGE gate removed; FIX #13 body is now unconditional.
 	//
-	// Stock EDGE path: single envCube.SampleLevel(normal, 8.0) — a GGX-prefiltered
+	// Evidence the #ifdef EDGE branch never compiled in shipping builds:
+	//   1) No fxo.edcz identity permutation of this file defines EDGE (batch
+	//      compiler never errored on a hard syntax error inside the branch).
+	//   2) Clean-slate FXO deploys generate zero new shaders - DCS never
+	//      requests a permutation outside the fxo.edcz set for this effect.
+	//   3) This is a technique10 effect, outside the terrain meta2 channel.
+	// Stock's EDGE-only delta (bottom wall = top x 0.7) is superseded by
+	// UpdateAmbientCubeBottomWall (FIX #11) regardless, so nothing of value
+	// existed in the gate. The consumer-side removals in
+	// SampleEnvironmentMapApprox (former steps 1 & 3) depend on this body
+	// actually running; unconditional compilation makes that pairing real.
+	//
+	// [MOD] FIX #13 - Cosine importance-sampled ambient cube faces.
+	//
+	// Stock EDGE path: single envCube.SampleLevel(normal, 8.0) - a GGX-prefiltered
 	// mip 8 point sample that averages the entire face, conflating sky and ground
 	// into one sky-dominated value for side walls.
 	//
@@ -163,7 +180,7 @@ void BuildAmbientCube(uint id: SV_GroupIndex, uniform uint samplesPerWall, unifo
 	// emphasizes directions near the face normal and de-emphasizes face edges
 	// where the opposing hemisphere bleeds in. Runs once per frame in compute.
 	//
-	// Face 3 (bottom) is placeholder — overwritten by UpdateAmbientCubeBottomWall.
+	// Face 3 (bottom) is placeholder - overwritten by UpdateAmbientCubeBottomWall.
 	float3 clr;
 	if (id == 3)
 	{
@@ -183,7 +200,7 @@ void BuildAmbientCube(uint id: SV_GroupIndex, uniform uint samplesPerWall, unifo
 		//      same source the bottom wall uses, FIX #11) as the ground half.
 		//
 		// The rejected-sample fraction MEASURES the cosine-weighted ground
-		// split (~0.5 for a side wall, ~0 for the top face) — the physical
+		// split (~0.5 for a side wall, ~0 for the top face) - the physical
 		// split falls out of the sampling instead of being hand-tuned. This
 		// makes the side-wall luminance/sun-side corrections in
 		// SampleEnvironmentMapApprox (steps 1 & 3) redundant; they are removed.
@@ -208,7 +225,7 @@ void BuildAmbientCube(uint id: SV_GroupIndex, uniform uint samplesPerWall, unifo
 
 			// Circumsolar exclusion, renormalized via wSky.
 			float sunW = 1.0 - smoothstep(SUN_EXCL_COS_OUTER, SUN_EXCL_COS_INNER,
-			                              dot(L, gSunDir.xyz));
+						dot(L, gSunDir.xyz));
 			skyAccum += envCube.SampleLevel(ClampLinearSampler, L, 4.0).rgb * sunW;
 			wSky += sunW;
 		}
@@ -216,12 +233,15 @@ void BuildAmbientCube(uint id: SV_GroupIndex, uniform uint samplesPerWall, unifo
 		float3 skyMean = skyAccum / max(wSky, 1e-3);
 
 		float groundFrac = float(nGround) / float(cosinesamples);
-		groundFrac = min(groundFrac, 0.33)
+		groundFrac = min(groundFrac, 0.33);
 		clr = lerp(skyMean, tmpValues[0].surfAmbient.rgb, groundFrac);
-	}
-#else
-	float3 clr = SampleEnvironmentCube(id, samplesPerWall, bOutdoor);
+
+#if GEP_CANARY_AMBIENT
+		// [DIAG] Liveness canary: ambient goes magenta if this compiled body
+		// is what the shipping permutation runs. REVERT GEP_CANARY_AMBIENT to 0.
+		clr = float3(1.0, 0.0, 1.0);
 #endif
+	}
 
 #ifndef USE_DCS_DEFERRED
 	if(bOutdoor)
@@ -280,12 +300,12 @@ void GetSurfaceColor(uniform uint samples)
 [numthreads(1,1,1)]
 void UpdateAmbientCubeBottomWall()
 {
-	// Interpolate terrain color — dParam provides temporal smoothing
+	// Interpolate terrain color - dParam provides temporal smoothing
 	tmpValues[0].surfAmbient = lerp(tmpValues[0].surfaceColorLast,
 	                                tmpValues[0].surfaceColorNew,
 	                                saturate(dParam));
 
-	// [MOD] FIX #11 — Use engine terrain render as bottom wall source.
+	// [MOD] FIX #11 - Use engine terrain render as bottom wall source.
 	//
 	// The engine renders a dedicated downward-looking view into a 2D texture
 	// each frame, capturing actual terrain color, cloud tops when above cloud
