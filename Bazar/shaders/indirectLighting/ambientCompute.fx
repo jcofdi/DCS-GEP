@@ -67,20 +67,44 @@ static const float3 binormals[] = {
 static const float	isSideWall[] = { 1, 1, 0, 0, 1, 1 };
 static const float3 lumCoef =  {0.2125f, 0.7154f, 0.0721f};
 
-// [MOD] Circumsolar exclusion for the ambient probe (split-sum convention).
-// The env-cube pass renders GetSkyRadiance, whose Cornette-Shanks Mie forward
-// lobe (g~0.8) is intense in the circumsolar cone. Sampled at mip 4 it smears
-// across ~+/-15-20 deg, so a sun-facing wall reads far brighter than the
-// diffuse sky it should represent - handing shadowed sun-facing surfaces
-// "sunlit" ambient. The disc + aureole are accounted by the analytic direct
-// term; counting them here double-counts direct light into ambient. Cone is
-// sized for the mip-4 smear, not the physical aureole (~5 deg).
-static const float SUN_EXCL_COS_INNER = 0.985;  // ~10 deg: full exclusion
-static const float SUN_EXCL_COS_OUTER = 0.906;  // ~25 deg: smooth edge
+// [MOD] Analytical sun subtraction (replaces circumsolar exclusion).
+//
+// The env-cube pass renders GetSkyRadiance, which includes the sun disk
+// and its Mie forward lobe. The direct lighting pass separately adds
+// gSunDiffuse * gSunIntensity * NoL, so including the sun in the ambient
+// cube double-counts that energy.
+//
+// The old approach excluded a 25-degree cone around the sun from the
+// importance sampling. This also removed the aureole and the natural
+// Rayleigh brightness gradient near the sun — legitimate ambient energy
+// that accounted for 50-90% of sun-facing wall luminance depending on
+// sun elevation. The resulting dim walls could fall below the consumer's
+// chrominance correction floor (0.001), triggering secondary artifacts.
+//
+// The new approach: sample the full hemisphere without exclusion, then
+// subtract the sun's measured excess from the computed mean. The cubemap
+// value at gSunDir (mip 4) minus the face mean estimates the sun's
+// radiance above the sky background. Scaled by NdotSun and a geometric
+// fraction, this removes the double-counted direct energy while
+// preserving the aureole and sky gradient.
+//
+// GEP_SUN_SUB_K: fraction of sunExcess * NdotSun to subtract.
+//   Derived from the mip-4 sun spread's cosine-weighted solid angle
+//   fraction (~0.02), but the Monte Carlo response to a bright point
+//   source concentrates more expected value per sample than the
+//   geometric fraction alone predicts. Start at 0.08, tune by flight:
+//   compare sun-facing vs anti-sun walls in the ambient canary.
+//   Too high: sun-facing walls darker than anti-sun. Too low: sun-facing
+//   walls carry visible extra energy into shadowed surfaces.
+#define GEP_SUN_SUB_K 0.08
 
-// [DIAG] 1 = paint side/top ambient walls magenta to prove the FIX #13 body
-// is live in the shipping permutation. Ship at 0.
-#define GEP_CANARY_AMBIENT 0
+// [DIAG] Test mode selector for ambient cube producer diagnostics.
+//   0 = Ship (cosine sampling + sun subtraction, current GEP)
+//   1 = TEST 1: Mip-8 revert (stock producer, answers "does the producer cause the glow?")
+//   2 = TEST 2a: Cosine sampling with groundFrac cap raised to 0.50
+//   3 = TEST 2b: Per-face color canary (which face dominates at distance?)
+//   4 = Magenta liveness canary
+#define GEP_AMBIENT_TEST 1
 
 groupshared float3	sharedCubeWalls[6];
 
@@ -188,31 +212,36 @@ void BuildAmbientCube(uint id: SV_GroupIndex, uniform uint samplesPerWall, unifo
 	}
 	else
 	{
-		// [MOD] Sun-cone exclusion + trusted ground half.
-		//
-		// Side walls previously cosine-integrated the full env probe, whose
-		// below-horizon half is unreliable hazed distant terrain, and whose
-		// circumsolar region carries the smeared Mie forward peak. This:
-		//   1) rejects below-horizon samples (the unreliable ground half),
-		//   2) excludes the circumsolar cone with weight renormalization
-		//      (in-paints the cone with surrounding diffuse sky),
-		//   3) composites the trusted live terrain render (surfAmbient, the
-		//      same source the bottom wall uses, FIX #11) as the ground half.
-		//
-		// The rejected-sample fraction MEASURES the cosine-weighted ground
-		// split (~0.5 for a side wall, ~0 for the top face) - the physical
-		// split falls out of the sampling instead of being hand-tuned. This
-		// makes the side-wall luminance/sun-side corrections in
-		// SampleEnvironmentMapApprox (steps 1 & 3) redundant; they are removed.
-		//
-		// surfAmbient here is last frame's smoothed value (pass order is
-		// buildCube -> surfaceColor -> updateCube), which is fine and slightly
-		// more temporally stable.
+#if GEP_AMBIENT_TEST == 1
+		// TEST 1: Stock mip-8 producer. If the glow disappears, the cosine
+		// sampling is the source. If it persists, look consumer-side.
+		clr = SampleEnvironmentCube(id, samplesPerWall, bOutdoor);
+
+#elif GEP_AMBIENT_TEST == 3
+		// TEST 2b: Per-face diagnostic colors at matched luminance.
+		// +X=red, -X=green, +Y=blue, +Z=yellow, -Z=cyan.
+		// The object's tint at distance reveals which face dominates nSquared.
+		static const float3 faceColors[] = {
+			float3(1.0, 0.1, 0.1),  // 0: +X  red
+			float3(0.1, 1.0, 0.1),  // 1: -X  green
+			float3(0.2, 0.2, 1.0),  // 2: +Y  blue
+			float3(0.0, 0.0, 0.0),  // 3: -Y  (placeholder, overwritten)
+			float3(1.0, 1.0, 0.1),  // 4: +Z  yellow
+			float3(0.1, 1.0, 1.0),  // 5: -Z  cyan
+		};
+		clr = faceColors[id] * 0.5;
+
+#elif GEP_AMBIENT_TEST == 4
+		// Magenta liveness canary.
+		clr = float3(1.0, 0.0, 1.0);
+
+#else
+		// Mode 0 (ship) and mode 2 (groundFrac test): full cosine sampling.
 		float3 N = normals[id];
 		float3 skyAccum = 0;
 		float  wSky = 0;
 		uint   nGround = 0;
-		const uint cosinesamples = 64;   // raised from 32: side walls reject ~half
+		const uint cosinesamples = 64;
 
 		[loop]
 		for (uint i = 0; i < cosinesamples; ++i)
@@ -220,26 +249,30 @@ void BuildAmbientCube(uint id: SV_GroupIndex, uniform uint samplesPerWall, unifo
 			float2 E = hammersley(i, cosinesamples);
 			float3 L = importanceSampleCosine(E, N);
 
-			// Reject the env-probe's below-horizon half.
 			if (L.y < 0.0) { nGround++; continue; }
 
-			// Circumsolar exclusion, renormalized via wSky.
-			float sunW = 1.0 - smoothstep(SUN_EXCL_COS_OUTER, SUN_EXCL_COS_INNER,
-						dot(L, gSunDir.xyz));
-			skyAccum += envCube.SampleLevel(ClampLinearSampler, L, 4.0).rgb * sunW;
-			wSky += sunW;
+			float w = 1.0;
+			skyAccum += envCube.SampleLevel(ClampLinearSampler, L, 4.0).rgb * w;
+			wSky += w;
 		}
 
 		float3 skyMean = skyAccum / max(wSky, 1e-3);
 
-		float groundFrac = float(nGround) / float(cosinesamples);
-		groundFrac = min(groundFrac, 0.33);
-		clr = lerp(skyMean, tmpValues[0].surfAmbient.rgb, groundFrac);
+		float NdotSun = max(0, dot(N, gSunDir.xyz));
+		if (NdotSun > 0)
+		{
+			float3 sunPeak = envCube.SampleLevel(ClampLinearSampler, gSunDir.xyz, 4.0).rgb;
+			float3 sunExcess = max(0, sunPeak - skyMean);
+			skyMean = max(0, skyMean - sunExcess * NdotSun * GEP_SUN_SUB_K);
+		}
 
-#if GEP_CANARY_AMBIENT
-		// [DIAG] Liveness canary: ambient goes magenta if this compiled body
-		// is what the shipping permutation runs. REVERT GEP_CANARY_AMBIENT to 0.
-		clr = float3(1.0, 0.0, 1.0);
+		float groundFrac = float(nGround) / float(cosinesamples);
+	#if GEP_AMBIENT_TEST == 2
+		groundFrac = min(groundFrac, 0.50);  // TEST 2a: natural 50/50 split
+	#else
+		groundFrac = min(groundFrac, 0.33);  // shipping cap
+	#endif
+		clr = lerp(skyMean, tmpValues[0].surfAmbient.rgb, groundFrac);
 #endif
 	}
 
