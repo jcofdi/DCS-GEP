@@ -78,12 +78,12 @@ float computeSteamConditions()
 	float sunCool = 0.85 - saturate(gSunDir.y) * 0.25;
 
 	// Cloud cover: overcast = cooler + more humid = steam lingers
-	// gCloudiness: 0 (clear) to ~800+ (overcast/broken)
-	// Normalize to 0..1, treat 900+ as fully overcast
+	// gCloudiness: 0 (clear) to ~.800+ (overcast/broken)
+	// Normalize to 0..1, treat .900+ as fully overcast
 	// 50% boost at full overcast - strongest real signal available
 	// This is the gatekeeper for maximum steam: only cloud cover
 	// plus low sun elevation can produce conditions = 1.0.
-	float cloudNorm = saturate(gCloudiness / 900.0);
+	float cloudNorm = saturate(gCloudiness);
 	float cloudCool = 1.0 + cloudNorm * 0.5;
 
 	// Combined range: ~0.60 (noon clear) to ~1.28 (dawn overcast) -> clamped 0..1
