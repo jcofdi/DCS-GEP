@@ -203,18 +203,18 @@ float3 SampleEnvironmentMapApprox(EnvironmentIrradianceSample eis, float3 normal
 	                         dot(pz, lumW), dot(mz, lumW));
 	float wallMean = dot(wallLums, 0.25);
 	float4 wallDev = abs(wallLums - wallMean);
-	float wallVariance = dot(wallDev, 0.25) / max(0.001, wallMean);
+	float wallVariance = dot(wallDev, 0.25) / max(1e-6, wallMean);
 
 	float hazeCorrection = saturate(1.0 - wallVariance * 4.0);
 
-	float topLum = max(0.001, dot(top, lumW));
+	float topLum = max(1e-6, dot(top, lumW));
 	float3 topChroma = top / topLum;
 
 	// === SIDE WALL CHROMINANCE HAZE CORRECTION ===
-	float corrPxLum = max(0.001, dot(px, lumW));
-	float corrMxLum = max(0.001, dot(mx, lumW));
-	float corrPzLum = max(0.001, dot(pz, lumW));
-	float corrMzLum = max(0.001, dot(mz, lumW));
+	float corrPxLum = max(1e-6, dot(px, lumW));
+	float corrMxLum = max(1e-6, dot(mx, lumW));
+	float corrPzLum = max(1e-6, dot(pz, lumW));
+	float corrMzLum = max(1e-6, dot(mz, lumW));
 
 	px = corrPxLum * lerp(px / corrPxLum, topChroma, hazeCorrection * 0.5);
 	mx = corrMxLum * lerp(mx / corrMxLum, topChroma, hazeCorrection * 0.5);
