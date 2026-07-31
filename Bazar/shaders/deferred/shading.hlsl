@@ -128,6 +128,20 @@ float3 EvaluateSunBRDF(float3 diffuseColor, float3 specularColor,
 	float discNorm   = alphaSun / alphaPrime;
 	sunSpecular *= discNorm * discNorm;
 
+	// [MOD] Firefly consistency clamp: a pixel's sun specular may not exceed
+	// the peak response its own filtered lobe permits. TK measures quad-scale
+	// normal variance; sub-quad glint features are invisible to ddx/ddy by
+	// construction - this bounds what TK cannot see, using TK's own alpha.
+	// Ceiling = K / (pi * a2): the GGX NDF peak of the widened lobe.
+	// Bracket GEP_FIREFLY_K 0.5-2.0 (1.0 default).
+	{
+		static const float GEP_FIREFLY_K = 1.0;
+		float a2FF = roughness * roughness * roughness * roughness;
+		float ceilLum = GEP_FIREFLY_K / (3.14159265 * max(a2FF, 1e-5));
+		float sLumFF = dot(sunSpecular, float3(0.2126, 0.7152, 0.0722));
+		sunSpecular *= min(1.0, ceilLum / max(sLumFF, 1e-6));
+	}
+	
 	// Direct sun diffuse Fresnel coupling: (1-F) partitions energy
 	// between specular and diffuse for punctual lights. For IBL, the
 	// hemispherically integrated E_ms is correct instead.
@@ -159,7 +173,26 @@ float3 ShadeSolid(EnvironmentIrradianceSample eis, float3 sunColor, float3 diffu
 	float novFade = smoothstep(0.1, 0.3, dot(normal, viewDir));
 	float fadedAO = lerp(bakedAO, AO, novFade);
 
-	float roughnessSun = modifyRoughnessByCloudShadow(roughness, cloudShadow);
+	// [MOD] Tokuyoshi-Kaplanyan filtered-normal specular AA (2019).
+#ifndef GEP_TK_GRADIENTS
+#define GEP_TK_GRADIENTS 1
+#endif
+	float roughnessAA;
+	{
+		static const float TK_SIGMA2 = 0.5;
+		static const float TK_KAPPA  = 0.25;
+#if GEP_TK_GRADIENTS
+			float3 nDu = ddx(normal);
+			float3 nDv = ddy(normal);
+			float  nVar = TK_SIGMA2 * (dot(nDu, nDu) + dot(nDv, nDv));
+			float  kernelA2 = min(2.0 * nVar, TK_KAPPA);
+#else
+			const float kernelA2 = 0.02;  // fixed kernel for loop contexts; bracket 0.01-0.05
+#endif
+		float  a2 = roughness * roughness * roughness * roughness;
+		roughnessAA = sqrt(sqrt(a2 + kernelA2));  // back to perceptual for D/Vis
+	}
+	float roughnessSun = modifyRoughnessByCloudShadow(roughnessAA, cloudShadow);
 	float NoL = max(0, dot(normal, gSunDir));
 	float NoV = max(0, dot(normal, viewDir)) + 1e-5;
 
