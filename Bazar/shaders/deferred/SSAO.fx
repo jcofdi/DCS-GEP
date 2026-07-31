@@ -388,7 +388,7 @@ float4 PS_BLUR(const VS_OUTPUT i, uniform int GAUSS_KERNEL): SV_TARGET0 {
 	//   1.6 = punchier, good if thick-feature AO (intakes, wells) feels weak
 	//   1.8+ = approaching Intel's 2.2, likely too aggressive with our
 	//          higher-than-Intel step count
-	return float4(pow(ao, 1.0), 0, 0, 1);
+	return float4(pow(ao, 1.4), 0, 0, 1);
 //    return float4(src.Load(uint3(i.pos.xy, 0)).x, 0, 0, 1); // to test unblurred output disable uncomment this and comment out above line
 }
 
