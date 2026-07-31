@@ -138,7 +138,7 @@ float3 ToneMapSample(const VS_OUTPUT i, uint idx, float3 sceneColor, uniform int
 	// exponent gives ~+0.35 EV at bright sun (avgLum 0.600) and ~-0.17
 	// EV at light overcast (avgLum 0.100).
 	{
-		float trueLum = max(getAverageLuminance(), 0.001);
+		float trueLum = max(getAverageLuminance(), 0.003);
 		float blend = smoothstep(0.03, 0.08, trueLum);
 		float gepExposureExponent = lerp(0.92, 0.80, blend);
 
