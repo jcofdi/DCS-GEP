@@ -114,6 +114,11 @@ float3 waterCompose(uint2 uvPix, float2 uvTex, float3 pos, float3 normal, float 
 	float3 viewDir = toCamera / (distance + 1e-9); // [MOD] then normalize
 
 	float3 sunLight = getSunLight(pos);
+	// [MOD] Cloud shadows on water: clouds attenuate the sun radiance itself
+	// (adopted pattern - see compose.hlsl solid path), NOT the cascade shadow
+	// term. Covers scatter AND the glint (waterShading derives specular from
+	// sunLight). Cascades remain sole owner of 'shadow'.
+	sunLight *= SampleShadowClouds(pos).x;
 
 	float3 deepColor = getDeepColor(riverLerp);
 	float3 color = deepColor * sunLight;	// color deep water
@@ -164,4 +169,4 @@ float3 underwaterCompose(uint2 uvPix, float2 uvTex, float3 pos, float3 normal, f
 	return color;
 }
 
-#endifa
+#endif
