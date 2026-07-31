@@ -25,7 +25,8 @@ float3 ShadeFoliage(uint2 uv, float3 sunColor, float3 diffuse, float3 normal, fl
 	finalColor += diffuseColor * SampleEnvironmentMapApprox(eis, normal, roughness) * (AO * gIBLIntensity);
 
 	//additional lighting
-	finalColor += CalculateDynamicLightingTiled(uv, diffuseColor, specularColor, roughness, normal, viewDir, pos, 0, energyLobe);
+	finalColor += CalculateDynamicLightingTiled(uv, diffuseColor, specularColor, roughness, normal, viewDir, pos, 0, energyLobe) * AO;
+
 
 	return finalColor;
 }
